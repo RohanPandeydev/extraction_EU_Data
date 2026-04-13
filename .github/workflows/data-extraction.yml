@@ -103,23 +103,23 @@ jobs:
       - name: Create output directory
         run: mkdir -p output
       
-      - name: Run all scrapers
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.scraper_type == 'all' }}
+      - name: Run main extraction script
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.scraper_type == 'all' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
-          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:all
+        run: node script.js
       
       - name: Run EUDAMED scrapers
         if: ${{ github.event.inputs.scraper_type == 'eudamed' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:eudamed
@@ -128,7 +128,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'vigilance' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:vigilance
@@ -137,7 +137,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'clinical' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:clinical
@@ -146,7 +146,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'certificates' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:certificates
@@ -155,7 +155,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'fsca' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:fsca
@@ -164,7 +164,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'ema' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:ema
@@ -173,7 +173,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'who' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:who
@@ -182,7 +182,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'cochrane' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:cochrane
@@ -191,7 +191,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'bfarm' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:bfarm
@@ -200,7 +200,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'ansm' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:ansm
@@ -209,7 +209,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'iss' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:iss
@@ -218,7 +218,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'igj' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:igj
@@ -227,7 +227,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'aemps' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:aemps
@@ -236,7 +236,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'nara' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:nara
@@ -245,7 +245,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'scenihr' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:scenihr
@@ -254,7 +254,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'economic-operators' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:eo
@@ -263,7 +263,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'notified-bodies' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:nb
@@ -272,7 +272,7 @@ jobs:
         if: ${{ github.event.inputs.scraper_type == 'refused-applications' }}
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:refused
@@ -339,7 +339,7 @@ jobs:
         if: steps.check-data.outputs.skip == 'false'
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
