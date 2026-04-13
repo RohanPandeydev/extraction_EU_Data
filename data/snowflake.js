@@ -514,12 +514,12 @@ async function insertDeviceComplete(deviceJSON) {
     );
   }
 
-  // 5. ADVERSE EVENTS
+  // 5. ADVERSE EVENTS (deduplicate by DEVICE_UUID + TITLE)
   const deviceName =
     deviceJSON.identity?.tradeName || deviceJSON.identity?.deviceName;
   for (const ae of deviceJSON.adverseEvents || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_ADVERSE_EVENTS (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO DEVICE_ADVERSE_EVENTS (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_ADVERSE_EVENTS WHERE DEVICE_UUID = ? AND TITLE = ?)`,
       [
         uuid,
         deviceName,
@@ -532,14 +532,16 @@ async function insertDeviceComplete(deviceJSON) {
         ae.url,
         ae.status || ae.type || ae.source,
         ae.date || ae.publicationDate,
+        uuid,
+        ae.title,
       ],
     );
   }
 
-  // 6. CLINICAL EVIDENCE
+  // 6. CLINICAL EVIDENCE (deduplicate by DEVICE_UUID + TITLE)
   for (const ce of deviceJSON.clinicalEvidence || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_CLINICAL_EVIDENCE (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO DEVICE_CLINICAL_EVIDENCE (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL) SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_CLINICAL_EVIDENCE WHERE DEVICE_UUID = ? AND TITLE = ?)`,
       [
         uuid,
         deviceName,
@@ -551,14 +553,16 @@ async function insertDeviceComplete(deviceJSON) {
         ce.publicationDate,
         ce.doi,
         ce.url,
+        uuid,
+        ce.title,
       ],
     );
   }
 
-  // 7. RELATED MEDICINES
+  // 7. RELATED MEDICINES (deduplicate by DEVICE_UUID + MEDICINE_NAME)
   for (const med of deviceJSON.relatedMedicines || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_RELATED_MEDICINES (DEVICE_UUID, DEVICE_NAME, SOURCE, MEDICINE_NAME, ACTIVE_SUBSTANCE, THERAPEUTIC_AREA, STATUS, HOLDER, URL) VALUES (?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO DEVICE_RELATED_MEDICINES (DEVICE_UUID, DEVICE_NAME, SOURCE, MEDICINE_NAME, ACTIVE_SUBSTANCE, THERAPEUTIC_AREA, STATUS, HOLDER, URL) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_RELATED_MEDICINES WHERE DEVICE_UUID = ? AND MEDICINE_NAME = ?)`,
       [
         uuid,
         deviceName,
@@ -569,6 +573,8 @@ async function insertDeviceComplete(deviceJSON) {
         med.status,
         med.holder,
         med.url,
+        uuid,
+        med.medicineName,
       ],
     );
   }
