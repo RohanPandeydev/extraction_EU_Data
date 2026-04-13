@@ -82,6 +82,7 @@ jobs:
     name: Extract Data
     runs-on: ubuntu-latest
     needs: lint-and-format
+    environment: dev
     if: >
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
@@ -307,6 +308,7 @@ jobs:
     name: Load to Snowflake
     runs-on: ubuntu-latest
     needs: extract-data
+    environment: dev
     if: always() && needs.extract-data.result == 'success'
     
     steps:
