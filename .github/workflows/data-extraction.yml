@@ -318,8 +318,14 @@ jobs:
         with:
           name: extracted-data
           path: output/
-      
+        continue-on-error: true
+
+      - name: Check if data exists
+        id: check-data
+        run: echo "has-data=$(find output/ -type f | head -1 | wc -l)" >> $GITHUB_OUTPUT
+
       - name: Load data to Snowflake
+        if: steps.check-data.outputs.has-data == '1'
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -328,3 +334,7 @@ jobs:
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
         run: npm run load:snowflake
+
+      - name: Skip Snowflake load
+        if: steps.check-data.outputs.has-data != '1'
+        run: echo "No data to load to Snowflake. The extract-data job may have produced no output."
