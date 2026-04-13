@@ -1,0 +1,510 @@
+const { query } = require("./database");
+async function createTableDevices() {
+  const queryText = `
+    CREATE TABLE IF NOT EXISTS devices (
+      id SERIAL PRIMARY KEY,
+      basic_udi VARCHAR(255),
+      primary_di VARCHAR(255),
+      uuid UUID UNIQUE,
+      ulid VARCHAR(26),
+      basic_udi_di_data_ulid VARCHAR(26),
+      risk_class_code VARCHAR(255),
+      trade_name VARCHAR(255),
+      manufacturer_name VARCHAR(255),
+      manufacturer_srn VARCHAR(255),
+      device_status_type_code VARCHAR(255),
+      manufacturer_names VARCHAR(255),
+      manufacturer_status_code VARCHAR(255),
+      latest_version BOOLEAN,
+      version_number INT,
+      basic_udi_data_uuid UUID,
+      basic_udi_data_ulid VARCHAR(26),
+      basic_udi_data_version_state VARCHAR(255),
+      version_state VARCHAR(255),
+      device_name VARCHAR(255),
+      device_model VARCHAR(255),
+      last_update_date TIMESTAMP,
+      reference VARCHAR(255),
+      basic_udi_data_version_number INT,
+      issuing_agency VARCHAR(255),
+      container_package_count INT,
+      mf_or_pr_srn VARCHAR(255),
+      applicable_legislation VARCHAR(255),
+      authorised_representative_srn VARCHAR(255),
+      authorised_representative_name VARCHAR(255),
+      sterile BOOLEAN,
+      multi_component BOOLEAN,
+      device_criterion VARCHAR(255)
+    );
+  `;
+  await query(queryText);
+}
+async function insertDeviceData(deviceData) {
+  const queryText = `
+    INSERT INTO devices (
+      basic_udi, primary_di, uuid, ulid, basic_udi_di_data_ulid, risk_class_code,
+      trade_name, manufacturer_name, manufacturer_srn, device_status_type_code,
+      manufacturer_names, manufacturer_status_code, latest_version, version_number,
+      basic_udi_data_uuid, basic_udi_data_ulid, basic_udi_data_version_state,
+      version_state, device_name, device_model, last_update_date, reference,
+      basic_udi_data_version_number, issuing_agency, container_package_count,
+      mf_or_pr_srn, applicable_legislation, authorised_representative_srn,
+      authorised_representative_name, sterile, multi_component, device_criterion
+    ) VALUES (
+      $1, $2, $3::uuid, $4, $5, $6,
+      $7, $8, $9, $10,
+      $11, $12, $13, $14,
+      $15::uuid, $16, $17,
+      $18, $19, $20, $21,
+      $22, $23, $24,
+      $25, $26, $27,
+      $28, $29, $30, $31, $32
+    )
+    ON CONFLICT (uuid) DO NOTHING
+  `;
+  const values = [
+    deviceData.basicUdi,
+    deviceData.primaryDi,
+    deviceData.uuid,
+    deviceData.ulid,
+    deviceData.basicUdiDiDataUlid,
+    deviceData.riskClass?.code,
+    deviceData.tradeName,
+    deviceData.manufacturerName,
+    deviceData.manufacturerSrn,
+    deviceData.deviceStatusType?.code,
+    deviceData.manufacturerNames,
+    deviceData.manufacturerStatus?.code,
+    deviceData.latestVersion,
+    deviceData.versionNumber,
+    deviceData.basicUdiDataUuid,
+    deviceData.basicUdiDataUlid,
+    deviceData.basicUdiDataVersionState,
+    deviceData.versionState,
+    deviceData.deviceName,
+    deviceData.deviceModel,
+    deviceData.lastUpdateDate,
+    deviceData.reference,
+    deviceData.basicUdiDataVersionNumber,
+    deviceData.issuingAgency,
+    deviceData.containerPackageCount,
+    deviceData.mfOrPrSrn,
+    deviceData.applicableLegislation,
+    deviceData.authorisedRepresentativeSrn,
+    deviceData.authorisedRepresentativeName,
+    deviceData.sterile,
+    deviceData.multiComponent,
+    deviceData.deviceCriterion,
+  ];
+  try {
+    await query(queryText, values);
+    // console.log("Device data inserted successfully");
+  } catch (error) {
+    console.error("Error inserting device data:", error);
+  }
+}
+async function getAllDevicesFromDB() {
+  const queryText = `
+    SELECT * FROM devices;
+  `;
+  try {
+    const result = await query(queryText);
+    return result.rows;
+  } catch (error) {
+    console.error("Error fetching all devices data:", error);
+    throw error;
+  }
+}
+const createTableDevicesSpecific = async () => {
+  const queryText = `
+    CREATE TABLE IF NOT EXISTS devices_specific (
+      id SERIAL PRIMARY KEY,
+      uuid VARCHAR(50) UNIQUE,
+      ulid VARCHAR(50),
+      udi_di_data JSONB,
+      manufacturer_uuid VARCHAR(50),
+      manufacturer_ulid VARCHAR(50),
+      manufacturer_version_number INT,
+      manufacturer_version_state_code VARCHAR(255),
+      manufacturer_latest_version BOOLEAN,
+      manufacturer_last_update_date VARCHAR(255),
+      manufacturer_name VARCHAR(255),
+      manufacturer_names JSONB,
+      manufacturer_abbreviated_names JSONB,
+      manufacturer_actor_type_code VARCHAR(255),
+      manufacturer_status_code VARCHAR(255),
+      manufacturer_status_from_date VARCHAR(255),
+      manufacturer_country_iso2_code VARCHAR(2),
+      manufacturer_country_name VARCHAR(255),
+      manufacturer_country_type VARCHAR(50),
+      manufacturer_geographical_address TEXT,
+      manufacturer_electronic_mail VARCHAR(255),
+      manufacturer_telephone VARCHAR(50),
+      manufacturer_srn VARCHAR(50),
+      authorised_representative JSONB,
+      active BOOLEAN,
+      administering_medicine BOOLEAN,
+      animal_tissues BOOLEAN,
+      nb_decision JSONB,
+      basic_udi_uuid VARCHAR(50),
+      basic_udi_code VARCHAR(255),
+      basic_udi_issuing_agency_code VARCHAR(255),
+      basic_udi_type VARCHAR(50),
+      basic_udi_new BOOLEAN,
+      companion_diagnostics BOOLEAN,
+      reagent BOOLEAN,
+      instrument BOOLEAN,
+      professional_testing BOOLEAN,
+      kit BOOLEAN,
+      device BOOLEAN,
+      multi_component BOOLEAN,
+      device_criterion VARCHAR(50),
+      basic_udi_type_code VARCHAR(50),
+      device_model VARCHAR(255),
+      device_model_applicable BOOLEAN,
+      device_name VARCHAR(255),
+      human_tissues BOOLEAN,
+      human_product BOOLEAN,
+      medicinal_product BOOLEAN,
+      implantable BOOLEAN,
+      sutures JSONB,
+      legislation_code VARCHAR(255),
+      measuring_function BOOLEAN,
+      microbial_substances JSONB,
+      near_patient_testing JSONB,
+      reusable BOOLEAN,
+      risk_class_code VARCHAR(255),
+      self_testing JSONB,
+      special_device_type_code VARCHAR(255),
+      special_device_type_applicable BOOLEAN,
+      medical_purpose JSONB,
+      type_examination_applicable JSONB,
+      device_certificate_info_list JSONB,
+      device_certificate_info_list_for_display JSONB,
+      clinical_investigation_applicable BOOLEAN,
+      clinical_investigation_links JSONB,
+      version_date VARCHAR(255),
+      version_state_code VARCHAR(255),
+      latest_version BOOLEAN,
+      version_number INT,
+      legacy_device_udi_di_applicable BOOLEAN,
+      discarded_date VARCHAR(255),
+      linked_sscp JSONB,
+      new BOOLEAN 
+    );
+  `;
+  try {
+    await query(queryText);
+    console.log("Table devices_specific created successfully");
+  } catch (error) {
+    console.error("Error creating devices_specific table:", error);
+  }
+};
+async function insertDeviceSpecificData(deviceData) {
+  const queryText = `
+    INSERT INTO devices_specific (
+      uuid, ulid, udi_di_data, manufacturer_uuid, manufacturer_ulid,
+      manufacturer_version_number, manufacturer_version_state_code,
+      manufacturer_latest_version, manufacturer_last_update_date,
+      manufacturer_name, manufacturer_names, manufacturer_abbreviated_names,
+      manufacturer_actor_type_code, manufacturer_status_code,
+      manufacturer_status_from_date, manufacturer_country_iso2_code,
+      manufacturer_country_name, manufacturer_country_type,
+      manufacturer_geographical_address, manufacturer_electronic_mail,
+      manufacturer_telephone, manufacturer_srn, authorised_representative,
+      active, administering_medicine, animal_tissues, nb_decision,
+      basic_udi_uuid, basic_udi_code, basic_udi_issuing_agency_code,
+      basic_udi_type, basic_udi_new, companion_diagnostics,
+      reagent, instrument, professional_testing, kit,
+      device, multi_component, device_criterion,
+      basic_udi_type_code, device_model, device_model_applicable,
+      device_name, human_tissues, human_product,
+      medicinal_product, implantable, sutures,
+      legislation_code, measuring_function,
+      microbial_substances, near_patient_testing,
+      reusable, risk_class_code, self_testing, special_device_type_code,
+      special_device_type_applicable, medical_purpose,
+      type_examination_applicable, device_certificate_info_list,
+      device_certificate_info_list_for_display,
+      clinical_investigation_applicable, clinical_investigation_links,
+      version_date,
+      version_state_code,
+      latest_version,
+      version_number,
+      legacy_device_udi_di_applicable,
+      discarded_date,
+      linked_sscp, new
+    ) VALUES (
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 
+      $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 
+      $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, 
+      $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, 
+      $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, 
+      $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, 
+      $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, 
+      $71, $72
+    )
+  `;
+
+  const values = [
+    deviceData.uuid,
+    deviceData.ulid,
+    deviceData.udiDiData,
+    deviceData.manufacturer.uuid,
+    deviceData.manufacturer.ulid,
+    deviceData.manufacturer.versionNumber,
+    deviceData.manufacturer.versionState.code,
+    deviceData.manufacturer.latestVersion,
+    deviceData.manufacturer.lastUpdateDate,
+    deviceData.manufacturer.name,
+    deviceData.manufacturer.names,
+    deviceData.manufacturer.abbreviatedNames,
+    deviceData.manufacturer.actorType.code,
+    deviceData.manufacturer.status.code,
+    deviceData.manufacturer.statusFromDate,
+    deviceData.manufacturer.countryIso2Code,
+    deviceData.manufacturer.countryName,
+    deviceData.manufacturer.countryType,
+    deviceData.manufacturer.geographicalAddress,
+    deviceData.manufacturer.electronicMail,
+    deviceData.manufacturer.telephone,
+    deviceData.manufacturer.srn,
+    deviceData.authorisedRepresentative,
+    deviceData.active,
+    deviceData.administeringMedicine,
+    deviceData.animalTissues,
+    deviceData.nbDecision,
+    deviceData.basicUdi.uuid,
+    deviceData.basicUdi.code,
+    deviceData.basicUdi.issuingAgency.code,
+    deviceData.basicUdi.type,
+    deviceData.basicUdi.new,
+    deviceData.companionDiagnostics,
+    deviceData.reagent,
+    deviceData.instrument,
+    deviceData.professionalTesting,
+    deviceData.kit,
+    deviceData.device,
+    deviceData.multiComponent,
+    deviceData.deviceCriterion,
+    deviceData.basicUdiType,
+    deviceData.deviceModel,
+    deviceData.deviceModelApplicable,
+    deviceData.deviceName,
+    deviceData.humanTissues,
+    deviceData.humanProduct,
+    deviceData.medicinalProduct,
+    deviceData.implantable,
+    deviceData.sutures,
+    deviceData.legislation.code,
+    deviceData.measuringFunction,
+    deviceData.microbialSubstances,
+    deviceData.nearPatientTesting,
+    deviceData.reusable,
+    deviceData.riskClass.code,
+    deviceData.selfTesting,
+    (deviceData.specialDeviceType && deviceData.specialDeviceType.code) || null,
+    (deviceData.specialDeviceType && deviceData.specialDeviceType.applicable) ||
+      null,
+    deviceData.medicalPurpose,
+    deviceData.typeExaminationApplicable,
+    deviceData.deviceCertificateInfoList,
+    deviceData.deviceCertificateInfoListForDisplay,
+    deviceData.clinicalInvestigationApplicable,
+    deviceData.clinicalInvestigationLinks,
+    deviceData.versionDate,
+    deviceData.versionState.code,
+    deviceData.latestVersion,
+    deviceData.versionNumber,
+    deviceData.legacyDeviceUdiDiApplicable,
+    deviceData.discardedDate,
+    deviceData.linkedSscp,
+    deviceData.new,
+  ];
+
+  try {
+    await query(queryText, values);
+    console.log("Device specific data inserted successfully");
+  } catch (error) {
+    console.error("Error inserting device specific data:", error);
+  }
+}
+async function insertOrUpdateDeviceSpecificData(deviceData) {
+  try {
+    // Check if the device already exists
+    const checkResult = await query(
+      "SELECT 1 FROM devices_specific WHERE uuid = $1",
+      [deviceData.uuid],
+    );
+    if (checkResult.rowCount > 0) {
+      // Exists: update
+      const updateText = `
+        UPDATE devices_specific SET
+          ulid = $2,
+          udi_di_data = $3,
+          manufacturer_uuid = $4,
+          manufacturer_ulid = $5,
+          manufacturer_version_number = $6,
+          manufacturer_version_state_code = $7,
+          manufacturer_latest_version = $8,
+          manufacturer_last_update_date = $9,
+          manufacturer_name = $10,
+          manufacturer_names = $11,
+          manufacturer_abbreviated_names = $12,
+          manufacturer_actor_type_code = $13,
+          manufacturer_status_code = $14,
+          manufacturer_status_from_date = $15,
+          manufacturer_country_iso2_code = $16,
+          manufacturer_country_name = $17,
+          manufacturer_country_type = $18,
+          manufacturer_geographical_address = $19,
+          manufacturer_electronic_mail = $20,
+          manufacturer_telephone = $21,
+          manufacturer_srn = $22,
+          authorised_representative = $23,
+          active = $24,
+          administering_medicine = $25,
+          animal_tissues = $26,
+          nb_decision = $27,
+          basic_udi_uuid = $28,
+          basic_udi_code = $29,
+          basic_udi_issuing_agency_code = $30,
+          basic_udi_type = $31,
+          basic_udi_new = $32,
+          companion_diagnostics = $33,
+          reagent = $34,
+          instrument = $35,
+          professional_testing = $36,
+          kit = $37,
+          device = $38,
+          multi_component = $39,
+          device_criterion = $40,
+          basic_udi_type_code = $41,
+          device_model = $42,
+          device_model_applicable = $43,
+          device_name = $44,
+          human_tissues = $45,
+          human_product = $46,
+          medicinal_product = $47,
+          implantable = $48,
+          sutures = $49,
+          legislation_code = $50,
+          measuring_function = $51,
+          microbial_substances = $52,
+          near_patient_testing = $53,
+          reusable = $54,
+          risk_class_code = $55,
+          self_testing = $56,
+          special_device_type_code = $57,
+          special_device_type_applicable = $58,
+          medical_purpose = $59,
+          type_examination_applicable = $60,
+          device_certificate_info_list = $61,
+          device_certificate_info_list_for_display = $62,
+          clinical_investigation_applicable = $63,
+          clinical_investigation_links = $64,
+          version_date = $65,
+          version_state_code = $66,
+          latest_version = $67,
+          version_number = $68,
+          legacy_device_udi_di_applicable = $69,
+          discarded_date = $70,
+          linked_sscp = $71,
+          new = $72
+        WHERE uuid = $1
+      `;
+      const values = [
+        deviceData.uuid,
+        deviceData.ulid,
+        deviceData.udiDiData,
+        deviceData.manufacturer.uuid,
+        deviceData.manufacturer.ulid,
+        deviceData.manufacturer.versionNumber,
+        deviceData.manufacturer.versionState.code,
+        deviceData.manufacturer.latestVersion,
+        deviceData.manufacturer.lastUpdateDate,
+        deviceData.manufacturer.name,
+        deviceData.manufacturer.names,
+        deviceData.manufacturer.abbreviatedNames,
+        deviceData.manufacturer.actorType.code,
+        deviceData.manufacturer.status.code,
+        deviceData.manufacturer.statusFromDate,
+        deviceData.manufacturer.countryIso2Code,
+        deviceData.manufacturer.countryName,
+        deviceData.manufacturer.countryType,
+        deviceData.manufacturer.geographicalAddress,
+        deviceData.manufacturer.electronicMail,
+        deviceData.manufacturer.telephone,
+        deviceData.manufacturer.srn,
+        deviceData.authorisedRepresentative,
+        deviceData.active,
+        deviceData.administeringMedicine,
+        deviceData.animalTissues,
+        deviceData.nbDecision,
+        deviceData.basicUdi.uuid,
+        deviceData.basicUdi.code,
+        deviceData.basicUdi.issuingAgency.code,
+        deviceData.basicUdi.type,
+        deviceData.basicUdi.new,
+        deviceData.companionDiagnostics,
+        deviceData.reagent,
+        deviceData.instrument,
+        deviceData.professionalTesting,
+        deviceData.kit,
+        deviceData.device,
+        deviceData.multiComponent,
+        deviceData.deviceCriterion,
+        deviceData.basicUdiType,
+        deviceData.deviceModel,
+        deviceData.deviceModelApplicable,
+        deviceData.deviceName,
+        deviceData.humanTissues,
+        deviceData.humanProduct,
+        deviceData.medicinalProduct,
+        deviceData.implantable,
+        deviceData.sutures,
+        deviceData.legislation.code,
+        deviceData.measuringFunction,
+        deviceData.microbialSubstances,
+        deviceData.nearPatientTesting,
+        deviceData.reusable,
+        deviceData.riskClass.code,
+        deviceData.selfTesting,
+        (deviceData.specialDeviceType && deviceData.specialDeviceType.code) ||
+          null,
+        (deviceData.specialDeviceType &&
+          deviceData.specialDeviceType.applicable) ||
+          null,
+        deviceData.medicalPurpose,
+        deviceData.typeExaminationApplicable,
+        deviceData.deviceCertificateInfoList,
+        deviceData.deviceCertificateInfoListForDisplay,
+        deviceData.clinicalInvestigationApplicable,
+        deviceData.clinicalInvestigationLinks,
+        deviceData.versionDate,
+        deviceData.versionState.code,
+        deviceData.latestVersion,
+        deviceData.versionNumber,
+        deviceData.legacyDeviceUdiDiApplicable,
+        deviceData.discardedDate,
+        deviceData.linkedSscp,
+        deviceData.new,
+      ];
+      await query(updateText, values);
+      console.log("Device specific data updated successfully");
+    } else {
+      // Not present: insert
+      await insertDeviceSpecificData(deviceData);
+    }
+  } catch (error) {
+    console.error("Error in insertOrUpdateDeviceSpecificData:", error);
+  }
+}
+module.exports = {
+  createTableDevices,
+  insertDeviceData,
+  getAllDevicesFromDB,
+  createTableDevicesSpecific,
+  insertDeviceSpecificData,
+  insertOrUpdateDeviceSpecificData,
+};
