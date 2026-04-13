@@ -527,11 +527,11 @@ async function insertDeviceComplete(deviceJSON) {
         ae.title,
         ae.authors,
         ae.journal,
-        ae.publicationDate,
+        ae.publicationDate || ae.date,
         ae.doi,
         ae.url,
-        ae.status,
-        ae.date,
+        ae.status || ae.type || ae.source,
+        ae.date || ae.publicationDate,
       ],
     );
   }
