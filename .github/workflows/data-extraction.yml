@@ -277,6 +277,14 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: npm run run:refused
       
+      - name: Ensure output directory has content
+        if: always()
+        run: |
+          mkdir -p output
+          if [ -z "$(ls -A output/ 2>/dev/null)" ]; then
+            echo "No data extracted. Skipping Snowflake load." > output/.no-data
+          fi
+
       - name: Upload output artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -318,14 +326,17 @@ jobs:
         with:
           name: extracted-data
           path: output/
-        continue-on-error: true
 
       - name: Check if data exists
         id: check-data
-        run: echo "has-data=$(find output/ -type f | head -1 | wc -l)" >> $GITHUB_OUTPUT
+        run: echo "skip=$(test -f output/.no-data && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Skip Snowflake load
+        if: steps.check-data.outputs.skip == 'true'
+        run: echo "No data to load. Extractors produced no output."
 
       - name: Load data to Snowflake
-        if: steps.check-data.outputs.has-data == '1'
+        if: steps.check-data.outputs.skip == 'false'
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USERNAME: ${{ secrets.SNOWFLAKE_USERNAME }}
@@ -334,7 +345,3 @@ jobs:
           SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
         run: npm run load:snowflake
-
-      - name: Skip Snowflake load
-        if: steps.check-data.outputs.has-data != '1'
-        run: echo "No data to load to Snowflake. The extract-data job may have produced no output."
