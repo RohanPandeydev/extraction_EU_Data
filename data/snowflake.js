@@ -408,7 +408,7 @@ async function insertDeviceComplete(deviceJSON) {
       deviceJSON.characteristics?.sterile || false,
       deviceJSON.characteristics?.measuringFunction || false,
       deviceJSON.characteristics?.administeringMedicine || false,
-      deviceJSON.characteristics?.multiComponent || false,
+      Boolean(deviceJSON.characteristics?.multiComponent && typeof deviceJSON.characteristics?.multiComponent !== 'object'),
       deviceJSON.characteristics?.humanTissues || false,
       deviceJSON.characteristics?.animalTissues || false,
       deviceJSON.characteristics?.humanProduct || false,
