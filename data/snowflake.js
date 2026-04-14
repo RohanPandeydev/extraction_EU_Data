@@ -28,8 +28,15 @@ function getConnection() {
 }
 
 // Snowflake SDK throws on undefined — convert to null
+// Also stringify objects/arrays to avoid unsupported VARIANT type errors
 function sanitizeBinds(binds) {
-  return binds.map((v) => (v === undefined ? null : v));
+  return binds.map((v) => {
+    if (v === undefined) return null;
+    if (v !== null && typeof v === "object" && !(v instanceof Date)) {
+      return JSON.stringify(v);
+    }
+    return v;
+  });
 }
 
 function executeSQL(sql, binds = []) {
@@ -432,21 +439,17 @@ async function insertDeviceComplete(deviceJSON) {
     await executeSQL(
       `
       MERGE INTO MANUFACTURERS AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
+      WHEN MATCHED THEN UPDATE SET
+        SRN=?, NAME=?, STATUS=?, COUNTRY_ISO2=?, COUNTRY_NAME=?, COUNTRY_TYPE=?, ADDRESS=?, EMAIL=?, PHONE=?
       WHEN NOT MATCHED THEN INSERT (UUID, SRN, NAME, STATUS, COUNTRY_ISO2, COUNTRY_NAME, COUNTRY_TYPE, ADDRESS, EMAIL, PHONE)
       VALUES (?,?,?,?,?,?,?,?,?,?)
     `,
       [
         mfr.uuid,
-        mfr.uuid,
-        mfr.srn,
-        mfr.name,
-        mfr.status,
-        mfr.countryIso2Code,
-        mfr.countryName,
-        mfr.countryType,
-        mfr.address,
-        mfr.email,
-        mfr.phone,
+        // UPDATE binds (9)
+        mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
+        // INSERT binds (10)
+        mfr.uuid, mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
       ],
     );
   }
@@ -455,18 +458,19 @@ async function insertDeviceComplete(deviceJSON) {
   const ar = deviceJSON.authorisedRepresentative;
   if (ar?.name) {
     await executeSQL(
-      `INSERT INTO AUTHORISED_REPRESENTATIVES (DEVICE_UUID, NAME, SRN, ADDRESS, COUNTRY_NAME, EMAIL, PHONE, MANDATE_START_DATE, MANDATE_END_DATE) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM AUTHORISED_REPRESENTATIVES WHERE DEVICE_UUID = ?)`,
+      `
+      MERGE INTO AUTHORISED_REPRESENTATIVES AS t USING (SELECT ? AS DEVICE_UUID) AS s ON t.DEVICE_UUID = s.DEVICE_UUID
+      WHEN MATCHED THEN UPDATE SET
+        NAME=?, SRN=?, ADDRESS=?, COUNTRY_NAME=?, EMAIL=?, PHONE=?, MANDATE_START_DATE=?, MANDATE_END_DATE=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, NAME, SRN, ADDRESS, COUNTRY_NAME, EMAIL, PHONE, MANDATE_START_DATE, MANDATE_END_DATE)
+      VALUES (?,?,?,?,?,?,?,?,?)
+      `,
       [
         uuid,
-        ar.name,
-        ar.srn,
-        ar.address,
-        ar.countryName,
-        ar.email,
-        ar.phone,
-        ar.mandateStartDate,
-        ar.mandateEndDate,
-        uuid,
+        // UPDATE binds (8)
+        ar.name, ar.srn, ar.address, ar.countryName, ar.email, ar.phone, ar.mandateStartDate, ar.mandateEndDate,
+        // INSERT binds (9)
+        uuid, ar.name, ar.srn, ar.address, ar.countryName, ar.email, ar.phone, ar.mandateStartDate, ar.mandateEndDate,
       ],
     );
   }
@@ -474,42 +478,41 @@ async function insertDeviceComplete(deviceJSON) {
   // 4. CERTIFICATES
   for (const cert of deviceJSON.certificates || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_CERTIFICATES (DEVICE_UUID, CERTIFICATE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STARTING_VALIDITY_DATE, STATUS, NOTIFIED_BODY_NAME, NOTIFIED_BODY_SRN, NOTIFIED_BODY_COUNTRY, REVISION, SOURCE) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_CERTIFICATES WHERE DEVICE_UUID = ? AND CERTIFICATE_UUID = ?)`,
+      `
+      MERGE INTO DEVICE_CERTIFICATES AS t
+      USING (SELECT ? AS DEVICE_UUID, ? AS CERTIFICATE_UUID) AS s
+      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.CERTIFICATE_UUID = s.CERTIFICATE_UUID
+      WHEN MATCHED THEN UPDATE SET
+        CERTIFICATE_NUMBER=?, CERTIFICATE_TYPE=?, ISSUE_DATE=?, EXPIRY_DATE=?, STARTING_VALIDITY_DATE=?, STATUS=?, NOTIFIED_BODY_NAME=?, NOTIFIED_BODY_SRN=?, NOTIFIED_BODY_COUNTRY=?, REVISION=?, SOURCE=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, CERTIFICATE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STARTING_VALIDITY_DATE, STATUS, NOTIFIED_BODY_NAME, NOTIFIED_BODY_SRN, NOTIFIED_BODY_COUNTRY, REVISION, SOURCE)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `,
       [
-        uuid,
-        cert.uuid,
-        cert.certificateNumber,
-        cert.certificateType,
-        cert.issueDate,
-        cert.expiryDate,
-        cert.startingValidityDate,
-        cert.status,
-        cert.notifiedBody?.name,
-        cert.notifiedBody?.srn,
-        cert.notifiedBody?.countryIso2Code,
-        cert.revision,
-        "EUDAMED",
-        uuid,
-        cert.uuid,
+        uuid, cert.uuid,
+        // UPDATE binds (11)
+        cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.startingValidityDate, cert.status, cert.notifiedBody?.name, cert.notifiedBody?.srn, cert.notifiedBody?.countryIso2Code, cert.revision, "EUDAMED",
+        // INSERT binds (13)
+        uuid, cert.uuid, cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.startingValidityDate, cert.status, cert.notifiedBody?.name, cert.notifiedBody?.srn, cert.notifiedBody?.countryIso2Code, cert.revision, "EUDAMED",
       ],
     );
   }
   for (const cert of deviceJSON.manufacturerCertificates || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_CERTIFICATES (DEVICE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STATUS, NOTIFIED_BODY_SRN, REVISION, SOURCE) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_CERTIFICATES WHERE DEVICE_UUID = ? AND CERTIFICATE_NUMBER = ? AND SOURCE = ?)`,
+      `
+      MERGE INTO DEVICE_CERTIFICATES AS t
+      USING (SELECT ? AS DEVICE_UUID, ? AS CERTIFICATE_NUMBER, ? AS SOURCE) AS s
+      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.CERTIFICATE_NUMBER = s.CERTIFICATE_NUMBER AND t.SOURCE = s.SOURCE
+      WHEN MATCHED THEN UPDATE SET
+        CERTIFICATE_TYPE=?, ISSUE_DATE=?, EXPIRY_DATE=?, STATUS=?, NOTIFIED_BODY_SRN=?, REVISION=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STATUS, NOTIFIED_BODY_SRN, REVISION, SOURCE)
+      VALUES (?,?,?,?,?,?,?,?,?)
+      `,
       [
-        uuid,
-        cert.certificateNumber,
-        cert.certificateType,
-        cert.issueDate,
-        cert.expiryDate,
-        cert.status,
-        cert.notifiedBodySrn,
-        cert.revision,
-        "EUDAMED_MFR",
-        uuid,
-        cert.certificateNumber,
-        "EUDAMED_MFR",
+        uuid, cert.certificateNumber, "EUDAMED_MFR",
+        // UPDATE binds (6)
+        cert.certificateType, cert.issueDate, cert.expiryDate, cert.status, cert.notifiedBodySrn, cert.revision,
+        // INSERT binds (9)
+        uuid, cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.status, cert.notifiedBodySrn, cert.revision, "EUDAMED_MFR",
       ],
     );
   }
@@ -519,21 +522,21 @@ async function insertDeviceComplete(deviceJSON) {
     deviceJSON.identity?.tradeName || deviceJSON.identity?.deviceName;
   for (const ae of deviceJSON.adverseEvents || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_ADVERSE_EVENTS (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_ADVERSE_EVENTS WHERE DEVICE_UUID = ? AND TITLE = ?)`,
+      `
+      MERGE INTO DEVICE_ADVERSE_EVENTS AS t
+      USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
+      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
+      WHEN MATCHED THEN UPDATE SET
+        DEVICE_NAME=?, SOURCE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?, STATUS=?, EVENT_DATE=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `,
       [
-        uuid,
-        deviceName,
-        ae.source,
-        ae.title,
-        ae.authors,
-        ae.journal,
-        ae.publicationDate || ae.date,
-        ae.doi,
-        ae.url,
-        ae.status || ae.type || ae.source,
-        ae.date || ae.publicationDate,
-        uuid,
-        ae.title,
+        uuid, ae.title,
+        // UPDATE binds (9)
+        deviceName, ae.source, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
+        // INSERT binds (11)
+        uuid, deviceName, ae.source, ae.title, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
       ],
     );
   }
@@ -541,20 +544,21 @@ async function insertDeviceComplete(deviceJSON) {
   // 6. CLINICAL EVIDENCE (deduplicate by DEVICE_UUID + TITLE)
   for (const ce of deviceJSON.clinicalEvidence || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_CLINICAL_EVIDENCE (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL) SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_CLINICAL_EVIDENCE WHERE DEVICE_UUID = ? AND TITLE = ?)`,
+      `
+      MERGE INTO DEVICE_CLINICAL_EVIDENCE AS t
+      USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
+      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
+      WHEN MATCHED THEN UPDATE SET
+        DEVICE_NAME=?, SOURCE=?, EVIDENCE_TYPE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+      `,
       [
-        uuid,
-        deviceName,
-        ce.source,
-        ce.type,
-        ce.title,
-        ce.authors,
-        ce.journal,
-        ce.publicationDate,
-        ce.doi,
-        ce.url,
-        uuid,
-        ce.title,
+        uuid, ce.title,
+        // UPDATE binds (8)
+        deviceName, ce.source, ce.type, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
+        // INSERT binds (10)
+        uuid, deviceName, ce.source, ce.type, ce.title, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
       ],
     );
   }
@@ -562,19 +566,21 @@ async function insertDeviceComplete(deviceJSON) {
   // 7. RELATED MEDICINES (deduplicate by DEVICE_UUID + MEDICINE_NAME)
   for (const med of deviceJSON.relatedMedicines || []) {
     await executeSQL(
-      `INSERT INTO DEVICE_RELATED_MEDICINES (DEVICE_UUID, DEVICE_NAME, SOURCE, MEDICINE_NAME, ACTIVE_SUBSTANCE, THERAPEUTIC_AREA, STATUS, HOLDER, URL) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM DEVICE_RELATED_MEDICINES WHERE DEVICE_UUID = ? AND MEDICINE_NAME = ?)`,
+      `
+      MERGE INTO DEVICE_RELATED_MEDICINES AS t
+      USING (SELECT ? AS DEVICE_UUID, ? AS MEDICINE_NAME) AS s
+      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.MEDICINE_NAME = s.MEDICINE_NAME
+      WHEN MATCHED THEN UPDATE SET
+        DEVICE_NAME=?, SOURCE=?, ACTIVE_SUBSTANCE=?, THERAPEUTIC_AREA=?, STATUS=?, HOLDER=?, URL=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, MEDICINE_NAME, ACTIVE_SUBSTANCE, THERAPEUTIC_AREA, STATUS, HOLDER, URL)
+      VALUES (?,?,?,?,?,?,?,?,?)
+      `,
       [
-        uuid,
-        deviceName,
-        med.source,
-        med.medicineName,
-        med.activeSubstance,
-        med.therapeuticArea,
-        med.status,
-        med.holder,
-        med.url,
-        uuid,
-        med.medicineName,
+        uuid, med.medicineName,
+        // UPDATE binds (7)
+        deviceName, med.source, med.activeSubstance, med.therapeuticArea, med.status, med.holder, med.url,
+        // INSERT binds (9)
+        uuid, deviceName, med.source, med.medicineName, med.activeSubstance, med.therapeuticArea, med.status, med.holder, med.url,
       ],
     );
   }
@@ -591,15 +597,19 @@ async function insertNotifiedBody(nb) {
       ?.split(".")
       .pop() || null;
   await executeSQL(
-    `INSERT INTO NOTIFIED_BODIES (UUID, NAME, IDENTIFIER, MDR_STATUS, IVDR_STATUS, RAW_DATA) SELECT ?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM NOTIFIED_BODIES WHERE UUID = ?)`,
+    `
+    MERGE INTO NOTIFIED_BODIES AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
+    WHEN MATCHED THEN UPDATE SET
+      NAME=?, IDENTIFIER=?, MDR_STATUS=?, IVDR_STATUS=?, RAW_DATA=?
+    WHEN NOT MATCHED THEN INSERT (UUID, NAME, IDENTIFIER, MDR_STATUS, IVDR_STATUS, RAW_DATA)
+    VALUES (?,?,?,?,?,?)
+    `,
     [
       nb.uuid,
-      nb.name,
-      nb.eudamedIdentifier,
-      mdrStatus,
-      ivdrStatus,
-      JSON.stringify(nb),
-      nb.uuid,
+      // UPDATE binds (5)
+      nb.name, nb.eudamedIdentifier, mdrStatus, ivdrStatus, JSON.stringify(nb),
+      // INSERT binds (6)
+      nb.uuid, nb.name, nb.eudamedIdentifier, mdrStatus, ivdrStatus, JSON.stringify(nb),
     ],
   );
 }
@@ -607,19 +617,19 @@ async function insertNotifiedBody(nb) {
 async function insertRefusedApplication(app) {
   await useDB();
   await executeSQL(
-    `INSERT INTO REFUSED_APPLICATIONS (UUID, ACTOR_SRN, ACTOR_NAME, NOTIFIED_BODY_SRN, APPLICATION_REFERENCE, CONFORMITY_PROCEDURE, DECISION, DECISION_DATE, LAST_UPDATE_DATE, RAW_DATA) SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM REFUSED_APPLICATIONS WHERE UUID = ?)`,
+    `
+    MERGE INTO REFUSED_APPLICATIONS AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
+    WHEN MATCHED THEN UPDATE SET
+      ACTOR_SRN=?, ACTOR_NAME=?, NOTIFIED_BODY_SRN=?, APPLICATION_REFERENCE=?, CONFORMITY_PROCEDURE=?, DECISION=?, DECISION_DATE=?, LAST_UPDATE_DATE=?, RAW_DATA=?
+    WHEN NOT MATCHED THEN INSERT (UUID, ACTOR_SRN, ACTOR_NAME, NOTIFIED_BODY_SRN, APPLICATION_REFERENCE, CONFORMITY_PROCEDURE, DECISION, DECISION_DATE, LAST_UPDATE_DATE, RAW_DATA)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+    `,
     [
       app.uuid,
-      app.actorSrn,
-      app.actorName,
-      app.notifiedBodySrn,
-      app.applicationReferenceNumber,
-      app.conformityAssessmentProcedure?.code,
-      app.decision?.code,
-      app.decisionDate,
-      app.lastUpdateDate,
-      JSON.stringify(app),
-      app.uuid,
+      // UPDATE binds (9)
+      app.actorSrn, app.actorName, app.notifiedBodySrn, app.applicationReferenceNumber, app.conformityAssessmentProcedure?.code, app.decision?.code, app.decisionDate, app.lastUpdateDate, JSON.stringify(app),
+      // INSERT binds (10)
+      app.uuid, app.actorSrn, app.actorName, app.notifiedBodySrn, app.applicationReferenceNumber, app.conformityAssessmentProcedure?.code, app.decision?.code, app.decisionDate, app.lastUpdateDate, JSON.stringify(app),
     ],
   );
 }
@@ -628,30 +638,19 @@ async function insertEMAMedicine(med) {
   await useDB();
   const id = med.ema_product_number || med.name_of_medicine;
   await executeSQL(
-    `INSERT INTO EMA_MEDICINES (PRODUCT_ID, MEDICINE_NAME, ACTIVE_SUBSTANCE, INN_NAME, ATC_CODE, THERAPEUTIC_AREA, PHARMACOTHERAPEUTIC_GROUP, THERAPEUTIC_INDICATION, MEDICINE_STATUS, OPINION_STATUS, MARKETING_AUTH_HOLDER, AUTHORIZATION_DATE, OPINION_DATE, DECISION_DATE, IS_BIOSIMILAR, IS_GENERIC, IS_ORPHAN, IS_CONDITIONAL, IS_ADVANCED_THERAPY, MEDICINE_URL, RAW_DATA) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM EMA_MEDICINES WHERE PRODUCT_ID = ?)`,
+    `
+    MERGE INTO EMA_MEDICINES AS t USING (SELECT ? AS PRODUCT_ID) AS s ON t.PRODUCT_ID = s.PRODUCT_ID
+    WHEN MATCHED THEN UPDATE SET
+      MEDICINE_NAME=?, ACTIVE_SUBSTANCE=?, INN_NAME=?, ATC_CODE=?, THERAPEUTIC_AREA=?, PHARMACOTHERAPEUTIC_GROUP=?, THERAPEUTIC_INDICATION=?, MEDICINE_STATUS=?, OPINION_STATUS=?, MARKETING_AUTH_HOLDER=?, AUTHORIZATION_DATE=?, OPINION_DATE=?, DECISION_DATE=?, IS_BIOSIMILAR=?, IS_GENERIC=?, IS_ORPHAN=?, IS_CONDITIONAL=?, IS_ADVANCED_THERAPY=?, MEDICINE_URL=?, RAW_DATA=?
+    WHEN NOT MATCHED THEN INSERT (PRODUCT_ID, MEDICINE_NAME, ACTIVE_SUBSTANCE, INN_NAME, ATC_CODE, THERAPEUTIC_AREA, PHARMACOTHERAPEUTIC_GROUP, THERAPEUTIC_INDICATION, MEDICINE_STATUS, OPINION_STATUS, MARKETING_AUTH_HOLDER, AUTHORIZATION_DATE, OPINION_DATE, DECISION_DATE, IS_BIOSIMILAR, IS_GENERIC, IS_ORPHAN, IS_CONDITIONAL, IS_ADVANCED_THERAPY, MEDICINE_URL, RAW_DATA)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `,
     [
       id,
-      med.name_of_medicine,
-      med.active_substance,
-      med.international_non_proprietary_name_common_name,
-      med.atc_code_human,
-      med.therapeutic_area_mesh,
-      med.pharmacotherapeutic_group_human,
-      med.therapeutic_indication,
-      med.medicine_status,
-      med.opinion_status,
-      med.marketing_authorisation_developer_applicant_holder,
-      med.marketing_authorisation_date,
-      med.opinion_adopted_date,
-      med.european_commission_decision_date,
-      med.biosimilar === "Yes",
-      med.generic === "Yes",
-      med.orphan_medicine === "Yes",
-      med.conditional_approval === "Yes",
-      med.advanced_therapy === "Yes",
-      med.medicine_url,
-      JSON.stringify(med),
-      id,
+      // UPDATE binds (20)
+      med.name_of_medicine, med.active_substance, med.international_non_proprietary_name_common_name, med.atc_code_human, med.therapeutic_area_mesh, med.pharmacotherapeutic_group_human, med.therapeutic_indication, med.medicine_status, med.opinion_status, med.marketing_authorisation_developer_applicant_holder, med.marketing_authorisation_date, med.opinion_adopted_date, med.european_commission_decision_date, med.biosimilar === "Yes", med.generic === "Yes", med.orphan_medicine === "Yes", med.conditional_approval === "Yes", med.advanced_therapy === "Yes", med.medicine_url, JSON.stringify(med),
+      // INSERT binds (21)
+      id, med.name_of_medicine, med.active_substance, med.international_non_proprietary_name_common_name, med.atc_code_human, med.therapeutic_area_mesh, med.pharmacotherapeutic_group_human, med.therapeutic_indication, med.medicine_status, med.opinion_status, med.marketing_authorisation_developer_applicant_holder, med.marketing_authorisation_date, med.opinion_adopted_date, med.european_commission_decision_date, med.biosimilar === "Yes", med.generic === "Yes", med.orphan_medicine === "Yes", med.conditional_approval === "Yes", med.advanced_therapy === "Yes", med.medicine_url, JSON.stringify(med),
     ],
   );
 }
@@ -661,18 +660,19 @@ async function insertCochraneReview(review) {
   const id = `pubmed_${review.uid}`;
   const authors = review.authors?.map((a) => a.name).join(", ") || "";
   await executeSQL(
-    `INSERT INTO COCHRANE_REVIEWS (PUBMED_ID, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, SEARCH_TERM, URL, RAW_DATA) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM COCHRANE_REVIEWS WHERE PUBMED_ID = ?)`,
+    `
+    MERGE INTO COCHRANE_REVIEWS AS t USING (SELECT ? AS PUBMED_ID) AS s ON t.PUBMED_ID = s.PUBMED_ID
+    WHEN MATCHED THEN UPDATE SET
+      TITLE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, SEARCH_TERM=?, URL=?, RAW_DATA=?
+    WHEN NOT MATCHED THEN INSERT (PUBMED_ID, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, SEARCH_TERM, URL, RAW_DATA)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    `,
     [
       id,
-      review.title,
-      authors,
-      review.fulljournalname,
-      review.pubdate || review.sortpubdate,
-      review.elocationid,
-      review.searchTerm,
-      `https://pubmed.ncbi.nlm.nih.gov/${review.uid}/`,
-      JSON.stringify(review),
-      id,
+      // UPDATE binds (8)
+      review.title, authors, review.fulljournalname, review.pubdate || review.sortpubdate, review.elocationid, review.searchTerm, `https://pubmed.ncbi.nlm.nih.gov/${review.uid}/`, JSON.stringify(review),
+      // INSERT binds (9)
+      id, review.title, authors, review.fulljournalname, review.pubdate || review.sortpubdate, review.elocationid, review.searchTerm, `https://pubmed.ncbi.nlm.nih.gov/${review.uid}/`, JSON.stringify(review),
     ],
   );
 }
@@ -681,20 +681,19 @@ async function insertSafetyNotice(source, record) {
   await useDB();
   const sourceId = `${source}_${(record.deviceName || record.title || "").substring(0, 200)}_${record.updateDate || record.date || ""}`;
   await executeSQL(
-    `INSERT INTO SAFETY_NOTICES (SOURCE, SOURCE_ID, TITLE, DEVICE_NAME, DEVICE_TYPE, STATUS, NOTICE_DATE, RETURN_DATE, TOPIC, URL, RAW_DATA) SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM SAFETY_NOTICES WHERE SOURCE_ID = ?)`,
+    `
+    MERGE INTO SAFETY_NOTICES AS t USING (SELECT ? AS SOURCE_ID) AS s ON t.SOURCE_ID = s.SOURCE_ID
+    WHEN MATCHED THEN UPDATE SET
+      SOURCE=?, TITLE=?, DEVICE_NAME=?, DEVICE_TYPE=?, STATUS=?, NOTICE_DATE=?, RETURN_DATE=?, TOPIC=?, URL=?, RAW_DATA=?
+    WHEN NOT MATCHED THEN INSERT (SOURCE, SOURCE_ID, TITLE, DEVICE_NAME, DEVICE_TYPE, STATUS, NOTICE_DATE, RETURN_DATE, TOPIC, URL, RAW_DATA)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `,
     [
-      source,
       sourceId,
-      record.title || record.deviceName,
-      record.deviceName,
-      record.deviceType,
-      record.status,
-      record.updateDate || record.date,
-      record.returnDate,
-      record.topic,
-      record.url,
-      JSON.stringify(record),
-      sourceId,
+      // UPDATE binds (10)
+      source, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
+      // INSERT binds (11)
+      source, sourceId, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
     ],
   );
 }
