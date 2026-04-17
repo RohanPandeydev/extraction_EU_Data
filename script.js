@@ -4,7 +4,7 @@ const { fetchJSON, fetchHTML } = require("./utils/httpClient");
 const {
   setupDatabase, insertDeviceComplete, insertNotifiedBody,
   insertRefusedApplication, insertSafetyNotice,
-  insertOpenFDAMaude, insertClinicalTrial, insertEuropePmc,
+  insertClinicalTrial, insertEuropePmc,
   getTableCount, closeConnection,
 } = require("./data/snowflake");
 
@@ -729,9 +729,22 @@ async function runBulkScrapers() {
       for (const event of data.results) records.push(event);
       await sleep(300, 500);
     }
-    for (const r of records) await insertOpenFDAMaude(r);
+    for (const r of records) {
+      const device = (r.device || [])[0] || {};
+      const key = r.mdr_report_key || r.report_number;
+      if (!key) continue;
+      await insertSafetyNotice("OPENFDA_MAUDE", {
+        title: device.generic_name || device.brand_name,
+        deviceName: device.generic_name || device.brand_name,
+        deviceType: r.event_type,
+        status: r.event_type,
+        updateDate: r.date_received,
+        topic: (r.product_problems || []).join("; ") || null,
+        url: `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfmaude/detail.cfm?mdrfoi__id=${key}`,
+      });
+    }
     bulkData.openfdaMaude = records;
-    log("BULK", `<<< openFDA MAUDE: ${records.length} -> Snowflake`);
+    log("BULK", `<<< openFDA MAUDE: ${records.length} -> SAFETY_NOTICES (source=OPENFDA_MAUDE)`);
     results.push({ name: "openFDA MAUDE", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< openFDA MAUDE FAILED: ${e.message}`); results.push({ name: "openFDA MAUDE", status: "FAILED", error: e.message }); }
 
@@ -865,7 +878,7 @@ async function main() {
   // Final stats
   console.log("");
   log("MAIN", "====== Final Snowflake Stats ======");
-  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "OPENFDA_MAUDE", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES"];
+  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES"];
   for (const t of tables) { const c = await getTableCount(t); log("MAIN", `  ${t}: ${c} rows`); }
 
   console.log("");

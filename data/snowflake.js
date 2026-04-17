@@ -73,6 +73,7 @@ async function setupDatabase() {
   await executeSQL(`DROP TABLE IF EXISTS EMA_MEDICINES`);
   await executeSQL(`DROP TABLE IF EXISTS COCHRANE_REVIEWS`);
   await executeSQL(`DROP TABLE IF EXISTS OPENFDA_510K`);
+  await executeSQL(`DROP TABLE IF EXISTS OPENFDA_MAUDE`);
 
   // === DEVICES (main table — flat, queryable columns) ===
   await executeSQL(`
@@ -285,27 +286,6 @@ async function setupDatabase() {
   `);
   // Migrate existing TOPIC column in case it's still VARCHAR from old schema
   await executeSQL(`ALTER TABLE SAFETY_NOTICES ALTER COLUMN TOPIC SET DATA TYPE TEXT`).catch(() => {});
-
-  // === OPENFDA MAUDE ADVERSE EVENTS ===
-  await executeSQL(`
-    CREATE TABLE IF NOT EXISTS OPENFDA_MAUDE (
-      ID NUMBER AUTOINCREMENT PRIMARY KEY,
-      MDR_REPORT_KEY VARCHAR(100) UNIQUE,
-      EVENT_TYPE VARCHAR(255),
-      DATE_RECEIVED VARCHAR(100),
-      DATE_OF_EVENT VARCHAR(100),
-      REPORT_SOURCE_CODE VARCHAR(10),
-      DEVICE_NAME TEXT,
-      BRAND_NAME VARCHAR(1000),
-      GENERIC_NAME VARCHAR(1000),
-      MANUFACTURER_NAME VARCHAR(1000),
-      PRODUCT_PROBLEMS TEXT,
-      EVENT_DESCRIPTION TEXT,
-      PATIENT_OUTCOME TEXT,
-      RAW_DATA TEXT,
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-  `);
 
   // === CLINICALTRIALS.GOV STUDIES ===
   await executeSQL(`
@@ -666,25 +646,6 @@ async function insertSafetyNotice(source, record) {
   );
 }
 
-async function insertOpenFDAMaude(r) {
-  const key = r.mdr_report_key || r.report_number;
-  if (!key) return;
-  const device = (r.device || [])[0] || {};
-  const products = (r.product_problems || []).join("; ") || null;
-  const mdrText = (r.mdr_text || []).map(t => t.text).filter(Boolean).join(" | ").substring(0, 5000);
-  await executeSQL(
-    `MERGE INTO OPENFDA_MAUDE AS t USING (SELECT ? AS MDR_REPORT_KEY) AS s ON t.MDR_REPORT_KEY = s.MDR_REPORT_KEY
-     WHEN MATCHED THEN UPDATE SET EVENT_TYPE=?, DATE_RECEIVED=?, DATE_OF_EVENT=?, REPORT_SOURCE_CODE=?, DEVICE_NAME=?, BRAND_NAME=?, GENERIC_NAME=?, MANUFACTURER_NAME=?, PRODUCT_PROBLEMS=?, EVENT_DESCRIPTION=?, PATIENT_OUTCOME=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (MDR_REPORT_KEY, EVENT_TYPE, DATE_RECEIVED, DATE_OF_EVENT, REPORT_SOURCE_CODE, DEVICE_NAME, BRAND_NAME, GENERIC_NAME, MANUFACTURER_NAME, PRODUCT_PROBLEMS, EVENT_DESCRIPTION, PATIENT_OUTCOME, RAW_DATA)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      key,
-      r.event_type, r.date_received, r.date_of_event, r.report_source_code, device.generic_name || device.brand_name, device.brand_name, device.generic_name, device.manufacturer_d_name || r.manufacturer_name, products, mdrText, ((r.patient || [])[0]?.patient_outcome || []).join(", "), JSON.stringify(r),
-      key, r.event_type, r.date_received, r.date_of_event, r.report_source_code, device.generic_name || device.brand_name, device.brand_name, device.generic_name, device.manufacturer_d_name || r.manufacturer_name, products, mdrText, ((r.patient || [])[0]?.patient_outcome || []).join(", "), JSON.stringify(r),
-    ],
-  );
-}
-
 async function insertClinicalTrial(r) {
   const p = r.protocolSection || r;
   const nctId = p.identificationModule?.nctId || r.nct_id;
@@ -764,7 +725,6 @@ module.exports = {
   insertNotifiedBody,
   insertRefusedApplication,
   insertSafetyNotice,
-  insertOpenFDAMaude,
   insertClinicalTrial,
   insertEuropePmc,
   getTableCount,
