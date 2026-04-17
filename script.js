@@ -4,7 +4,7 @@ const { fetchJSON, fetchHTML } = require("./utils/httpClient");
 const {
   setupDatabase, insertDeviceComplete, insertNotifiedBody,
   insertRefusedApplication, insertSafetyNotice,
-  insertOpenFDA510k, insertOpenFDAMaude, insertClinicalTrial, insertEuropePmc,
+  insertOpenFDAMaude, insertClinicalTrial, insertEuropePmc,
   getTableCount, closeConnection,
 } = require("./data/snowflake");
 
@@ -110,7 +110,7 @@ function buildDeviceJSON(basic, detail) {
 let bulkData = {
   ansm: [], cochrane: [], scheer: [], ema: [],
   bfarm: [], aemps: [], igj: [], iss: [],
-  openfdaRecalls: [], openfda510k: [], openfdaMaude: [],
+  openfdaRecalls: [], openfdaMaude: [],
   clinicalTrials: [], europePmc: [],
 };
 
@@ -710,7 +710,7 @@ async function runBulkScrapers() {
         title: r.productDescription || r.brandName, deviceName: r.productDescription || r.brandName,
         deviceType: r.classification, status: r.recallStatus, updateDate: r.datePosted,
         url: r.cfresId ? `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfres/res.cfm?id=${r.cfresId}` : null,
-        topic: r.reasonForRecall,
+        topic: r.reasonForRecall || null,
       });
     }
     bulkData.openfdaRecalls = records;
@@ -718,24 +718,7 @@ async function runBulkScrapers() {
     results.push({ name: "openFDA Recalls", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< openFDA Recalls FAILED: ${e.message}`); results.push({ name: "openFDA Recalls", status: "FAILED", error: e.message }); }
 
-  // 12. openFDA 510(k) Clearances
-  log("BULK", ">>> openFDA 510(k) Clearances");
-  try {
-    const records = [];
-    const maxPages = process.env.OPENFDA_510K_PAGES ? parseInt(process.env.OPENFDA_510K_PAGES) : 10;
-    for (let page = 0; page < maxPages; page++) {
-      const data = await fetchJSON(`https://api.fda.gov/device/510k.json?limit=100&skip=${page * 100}&sort=decision_date:desc`, { headers: { "User-Agent": "eudamed-extraction/1.0" } });
-      if (!data.results || data.results.length === 0) break;
-      for (const clearance of data.results) records.push(clearance);
-      await sleep(300, 500);
-    }
-    for (const r of records) await insertOpenFDA510k(r);
-    bulkData.openfda510k = records;
-    log("BULK", `<<< openFDA 510k: ${records.length} -> Snowflake`);
-    results.push({ name: "openFDA 510k", status: "SUCCESS" });
-  } catch (e) { log("BULK", `<<< openFDA 510k FAILED: ${e.message}`); results.push({ name: "openFDA 510k", status: "FAILED", error: e.message }); }
-
-  // 13. openFDA MAUDE Adverse Events
+  // 12. openFDA MAUDE Adverse Events
   log("BULK", ">>> openFDA MAUDE Adverse Events");
   try {
     const records = [];
@@ -882,7 +865,7 @@ async function main() {
   // Final stats
   console.log("");
   log("MAIN", "====== Final Snowflake Stats ======");
-  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "OPENFDA_510K", "OPENFDA_MAUDE", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES"];
+  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "OPENFDA_MAUDE", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES"];
   for (const t of tables) { const c = await getTableCount(t); log("MAIN", `  ${t}: ${c} rows`); }
 
   console.log("");

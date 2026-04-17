@@ -72,6 +72,7 @@ async function setupDatabase() {
   await executeSQL(`DROP TABLE IF EXISTS DEVICE_RELATED_MEDICINES`);
   await executeSQL(`DROP TABLE IF EXISTS EMA_MEDICINES`);
   await executeSQL(`DROP TABLE IF EXISTS COCHRANE_REVIEWS`);
+  await executeSQL(`DROP TABLE IF EXISTS OPENFDA_510K`);
 
   // === DEVICES (main table — flat, queryable columns) ===
   await executeSQL(`
@@ -264,7 +265,7 @@ async function setupDatabase() {
     )
   `);
 
-  // === SAFETY NOTICES (ANSM, SCHEER, etc.) ===
+  // === SAFETY NOTICES (ANSM, SCHEER, openFDA recalls etc.) ===
   await executeSQL(`
     CREATE TABLE IF NOT EXISTS SAFETY_NOTICES (
       ID NUMBER AUTOINCREMENT PRIMARY KEY,
@@ -276,31 +277,14 @@ async function setupDatabase() {
       STATUS VARCHAR(255),
       NOTICE_DATE VARCHAR(255),
       RETURN_DATE VARCHAR(255),
-      TOPIC VARCHAR(500),
+      TOPIC TEXT,
       URL TEXT,
       RAW_DATA TEXT,
       CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
     )
   `);
-
-  // === OPENFDA 510(k) CLEARANCES ===
-  await executeSQL(`
-    CREATE TABLE IF NOT EXISTS OPENFDA_510K (
-      ID NUMBER AUTOINCREMENT PRIMARY KEY,
-      K_NUMBER VARCHAR(50) UNIQUE,
-      DEVICE_NAME TEXT,
-      APPLICANT VARCHAR(1000),
-      PRODUCT_CODE VARCHAR(50),
-      DECISION_DATE VARCHAR(100),
-      DECISION_DESCRIPTION VARCHAR(500),
-      DATE_RECEIVED VARCHAR(100),
-      STATEMENT_OR_SUMMARY VARCHAR(100),
-      CLEARANCE_TYPE VARCHAR(200),
-      THIRD_PARTY_FLAG VARCHAR(10),
-      RAW_DATA TEXT,
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-  `);
+  // Migrate existing TOPIC column in case it's still VARCHAR from old schema
+  await executeSQL(`ALTER TABLE SAFETY_NOTICES ALTER COLUMN TOPIC SET DATA TYPE TEXT`).catch(() => {});
 
   // === OPENFDA MAUDE ADVERSE EVENTS ===
   await executeSQL(`
@@ -682,20 +666,6 @@ async function insertSafetyNotice(source, record) {
   );
 }
 
-async function insertOpenFDA510k(r) {
-  await executeSQL(
-    `MERGE INTO OPENFDA_510K AS t USING (SELECT ? AS K_NUMBER) AS s ON t.K_NUMBER = s.K_NUMBER
-     WHEN MATCHED THEN UPDATE SET DEVICE_NAME=?, APPLICANT=?, PRODUCT_CODE=?, DECISION_DATE=?, DECISION_DESCRIPTION=?, DATE_RECEIVED=?, STATEMENT_OR_SUMMARY=?, CLEARANCE_TYPE=?, THIRD_PARTY_FLAG=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (K_NUMBER, DEVICE_NAME, APPLICANT, PRODUCT_CODE, DECISION_DATE, DECISION_DESCRIPTION, DATE_RECEIVED, STATEMENT_OR_SUMMARY, CLEARANCE_TYPE, THIRD_PARTY_FLAG, RAW_DATA)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      r.k_number,
-      r.device_name, r.applicant, r.product_code, r.decision_date, r.decision_description, r.date_received, r.statement_or_summary, r.clearance_type, r.third_party_flag, JSON.stringify(r),
-      r.k_number, r.device_name, r.applicant, r.product_code, r.decision_date, r.decision_description, r.date_received, r.statement_or_summary, r.clearance_type, r.third_party_flag, JSON.stringify(r),
-    ],
-  );
-}
-
 async function insertOpenFDAMaude(r) {
   const key = r.mdr_report_key || r.report_number;
   if (!key) return;
@@ -794,7 +764,6 @@ module.exports = {
   insertNotifiedBody,
   insertRefusedApplication,
   insertSafetyNotice,
-  insertOpenFDA510k,
   insertOpenFDAMaude,
   insertClinicalTrial,
   insertEuropePmc,
