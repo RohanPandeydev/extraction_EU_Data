@@ -12,6 +12,17 @@ name: Medical Device Data Extraction -> Snowflake
 # ==========================
 
 on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'script.js'
+      - 'data/**'
+      - 'scrapers/**'
+      - 'utils/**'
+      - 'headers.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/data-extraction.yml'
   schedule:
     # Daily device extraction — rotating 16-day coverage cycle
     - cron: '0 2 * * *'
@@ -48,6 +59,11 @@ env:
   NODE_VERSION: '20'
   TOTAL_CHUNKS: '16'   # 16-day rotation → 16 days to cover full 1.59M DB
 
+# Prevent overlapping runs (push commits while one is running → queue/cancel)
+concurrency:
+  group: data-extraction-${{ github.ref }}
+  cancel-in-progress: false   # let running job finish; newer pushes queue behind
+
 jobs:
   # ============================================
   # Determine run mode + chunk_offset
@@ -75,10 +91,14 @@ jobs:
               OFFSET='0'
             else
               MODE='parallel-full'
-              # Rotate chunk_offset by day-of-year modulo 16 (0..15)
               DAY_OF_YEAR=$(date -u +%j | sed 's/^0*//')
               OFFSET=$((DAY_OF_YEAR % 16))
             fi
+          elif [ "$EVENT" = "push" ]; then
+            # Auto-run on push — same rotation as daily cron
+            MODE='parallel-full'
+            DAY_OF_YEAR=$(date -u +%j | sed 's/^0*//')
+            OFFSET=$((DAY_OF_YEAR % 16))
           else
             MODE="${INPUT_MODE:-parallel-full}"
             OFFSET="${INPUT_OFFSET:-0}"
