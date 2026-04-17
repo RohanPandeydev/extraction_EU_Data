@@ -1,111 +1,129 @@
-name: Data Extraction Pipeline
+name: Medical Device Data Extraction -> Snowflake
+
+# ==== SCHEDULING STRATEGY ====
+# EUDAMED has ~1.59M devices. GH Actions max job = 6hr = ~5,000 devices.
+# With 20 parallel matrix jobs = ~100K devices per workflow run.
+# Full DB coverage in 16 days at one chunk/day.
+#
+# CRON:
+#   Daily 02:00 UTC — processes ONE chunk of ~100K devices (rotating chunk_offset 0→15)
+#   Weekly Sunday 01:00 UTC — refreshes Phase 1 bulk sources only (reference data)
+#   Manual dispatch — targeted runs with custom inputs
+# ==========================
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   schedule:
-    # Run daily at 2 AM UTC
+    # Daily device extraction — rotating 16-day coverage cycle
     - cron: '0 2 * * *'
+    # Weekly bulk-only refresh
+    - cron: '0 1 * * 0'
   workflow_dispatch:
     inputs:
-      scraper_type:
-        description: 'Scraper type to run'
+      mode:
+        description: 'Run mode'
         required: true
-        default: 'all'
+        default: 'parallel-full'
         type: choice
         options:
-          - all
-          - eudamed
-          - vigilance
-          - clinical
-          - certificates
-          - fsca
-          - ema
-          - who
-          - cochrane
-          - bfarm
-          - ansm
-          - iss
-          - igj
-          - aemps
-          - nara
-          - scenihr
-          - economic-operators
-          - notified-bodies
-          - refused-applications
+          - 'parallel-full'   # 20 parallel × 5K devices = ~100K per run
+          - 'single-range'    # One job, use max_devices + start_page
+          - 'bulk-only'       # Phase 1 only (refresh reference data)
+      max_devices:
+        description: '[single-range] Max devices (empty = until timeout)'
+        required: false
+        default: ''
+        type: string
+      start_page:
+        description: '[single-range] Resume from page N'
+        required: false
+        default: '0'
+        type: string
+      chunk_offset:
+        description: '[parallel-full] Chunk offset (0=pages 0-340, 1=341-680 ...). Auto-rotates on cron.'
+        required: false
+        default: ''
+        type: string
 
 env:
-  NODE_VERSION: '18'
+  NODE_VERSION: '20'
+  TOTAL_CHUNKS: '16'   # 16-day rotation → 16 days to cover full 1.59M DB
 
 jobs:
-  lint-and-format:
-    name: Lint and Format Check
+  # ============================================
+  # Determine run mode + chunk_offset
+  # cron 02:00 daily → parallel-full with rotating offset
+  # cron 01:00 Sunday → bulk-only
+  # manual dispatch → user-provided
+  # ============================================
+  plan:
+    name: Plan run
     runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.p.outputs.mode }}
+      chunk_offset: ${{ steps.p.outputs.chunk_offset }}
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Run ESLint
-        run: npm run lint
+      - id: p
+        run: |
+          EVENT='${{ github.event_name }}'
+          SCHEDULE='${{ github.event.schedule }}'
+          INPUT_MODE='${{ github.event.inputs.mode }}'
+          INPUT_OFFSET='${{ github.event.inputs.chunk_offset }}'
 
-  test:
-    name: Run Tests
+          if [ "$EVENT" = "schedule" ]; then
+            if [ "$SCHEDULE" = "0 1 * * 0" ]; then
+              MODE='bulk-only'
+              OFFSET='0'
+            else
+              MODE='parallel-full'
+              # Rotate chunk_offset by day-of-year modulo 16 (0..15)
+              DAY_OF_YEAR=$(date -u +%j | sed 's/^0*//')
+              OFFSET=$((DAY_OF_YEAR % 16))
+            fi
+          else
+            MODE="${INPUT_MODE:-parallel-full}"
+            OFFSET="${INPUT_OFFSET:-0}"
+          fi
+
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "chunk_offset=$OFFSET" >> $GITHUB_OUTPUT
+          echo "=== Plan: mode=$MODE, chunk_offset=$OFFSET ==="
+
+  # ============================================
+  # Lint (non-blocking, parallel)
+  # ============================================
+  lint:
+    name: Lint (non-blocking)
     runs-on: ubuntu-latest
-    needs: lint-and-format
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Run tests
-        run: npm test
+      - run: npm ci
+      - run: npm run lint
         continue-on-error: true
 
-  extract-data:
-    name: Extract Data
+  # ============================================
+  # PHASE 1 — Bulk sources (~30 min)
+  # Always runs first. Skipped only when upstream jobs need to share state.
+  # ============================================
+  bulk:
+    name: Phase 1 — Bulk Sources
     runs-on: ubuntu-latest
-    needs: lint-and-format
+    needs: plan
     environment: dev
-    if: >
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
-    timeout-minutes: 60
-    
+    timeout-minutes: 90
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Create output directory
-        run: mkdir -p output
-      
-      - name: Run main extraction script
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event.inputs.scraper_type == 'all' }}
+      - run: npm ci
+
+      - name: Run Phase 1 (bulk-only)
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
@@ -113,237 +131,132 @@ jobs:
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
           SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
           SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SKIP_PHASE2: 'true'
+          OPENFDA_MAX_PAGES: '50'
+          OPENFDA_510K_PAGES: '50'
+          OPENFDA_MAUDE_PAGES: '50'
+          CTGOV_PAGES: '20'
         run: node script.js
-      
-      - name: Run EUDAMED scrapers
-        if: ${{ github.event.inputs.scraper_type == 'eudamed' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:eudamed
-      
-      - name: Run vigilance scraper
-        if: ${{ github.event.inputs.scraper_type == 'vigilance' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:vigilance
-      
-      - name: Run clinical investigations scraper
-        if: ${{ github.event.inputs.scraper_type == 'clinical' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:clinical
-      
-      - name: Run certificates scraper
-        if: ${{ github.event.inputs.scraper_type == 'certificates' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:certificates
-      
-      - name: Run FSCA scraper
-        if: ${{ github.event.inputs.scraper_type == 'fsca' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:fsca
-      
-      - name: Run EMA scraper
-        if: ${{ github.event.inputs.scraper_type == 'ema' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:ema
-      
-      - name: Run WHO VigiBase scraper
-        if: ${{ github.event.inputs.scraper_type == 'who' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:who
-      
-      - name: Run Cochrane scraper
-        if: ${{ github.event.inputs.scraper_type == 'cochrane' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:cochrane
-      
-      - name: Run BfArM scraper
-        if: ${{ github.event.inputs.scraper_type == 'bfarm' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:bfarm
-      
-      - name: Run ANSM scraper
-        if: ${{ github.event.inputs.scraper_type == 'ansm' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:ansm
-      
-      - name: Run ISS scraper
-        if: ${{ github.event.inputs.scraper_type == 'iss' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:iss
-      
-      - name: Run IGJ scraper
-        if: ${{ github.event.inputs.scraper_type == 'igj' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:igj
-      
-      - name: Run AEMPS scraper
-        if: ${{ github.event.inputs.scraper_type == 'aemps' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:aemps
-      
-      - name: Run NARA scraper
-        if: ${{ github.event.inputs.scraper_type == 'nara' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:nara
-      
-      - name: Run SCENIHR scraper
-        if: ${{ github.event.inputs.scraper_type == 'scenihr' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:scenihr
-      
-      - name: Run economic operators scraper
-        if: ${{ github.event.inputs.scraper_type == 'economic-operators' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:eo
-      
-      - name: Run notified bodies scraper
-        if: ${{ github.event.inputs.scraper_type == 'notified-bodies' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:nb
-      
-      - name: Run refused applications scraper
-        if: ${{ github.event.inputs.scraper_type == 'refused-applications' }}
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: npm run run:refused
-      
-      - name: Ensure output directory has content
-        if: always()
-        run: |
-          mkdir -p output
-          if [ -z "$(ls -A output/ 2>/dev/null)" ]; then
-            echo "No data extracted. Skipping Snowflake load." > output/.no-data
-          fi
 
-      - name: Upload output artifacts
+      - name: Upload bulk logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: extracted-data
-          path: output/
-          retention-days: 30
-      
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: extraction-logs
-          path: |
-            *.log
-            snowflake.log
-          retention-days: 7
+          name: bulk-logs-${{ github.run_id }}
+          path: snowflake.log
+          if-no-files-found: ignore
+          retention-days: 14
 
-  load-to-snowflake:
-    name: Load to Snowflake
+  # ============================================
+  # PHASE 2 parallel — 20 matrix jobs
+  # Each ~5,100 devices, total ~100K per workflow run.
+  # ============================================
+  devices-parallel:
+    name: Phase 2 — Devices (shard ${{ matrix.shard }})
+    if: needs.plan.outputs.mode == 'parallel-full'
     runs-on: ubuntu-latest
-    needs: extract-data
+    needs: [plan, bulk]
     environment: dev
-    if: always() && needs.extract-data.result == 'success'
-    
+    timeout-minutes: 350
+
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-      
-      - name: Install dependencies
-        run: npm ci
-      
-      - name: Download extracted data
-        uses: actions/download-artifact@v4
-        with:
-          name: extracted-data
-          path: output/
+      - run: npm ci
 
-      - name: Check if data exists
-        id: check-data
-        run: echo "skip=$(test -f output/.no-data && echo true || echo false)" >> $GITHUB_OUTPUT
+      - name: Compute page range for this shard
+        id: range
+        run: |
+          CHUNK_OFFSET=${{ needs.plan.outputs.chunk_offset }}
+          SHARD=${{ matrix.shard }}
+          # Each shard = 17 pages (5100 devices) to fit inside 6hr
+          PAGES_PER_SHARD=17
+          SHARDS_PER_CHUNK=20
+          START=$((CHUNK_OFFSET * SHARDS_PER_CHUNK * PAGES_PER_SHARD + SHARD * PAGES_PER_SHARD))
+          MAX=$((PAGES_PER_SHARD * 300))
+          echo "start_page=$START" >> $GITHUB_OUTPUT
+          echo "max_devices=$MAX" >> $GITHUB_OUTPUT
+          echo "=== Shard $SHARD: start_page=$START, max_devices=$MAX (pages $START..$((START + PAGES_PER_SHARD - 1))) ==="
 
-      - name: Skip Snowflake load
-        if: steps.check-data.outputs.skip == 'true'
-        run: echo "No data to load. Extractors produced no output."
-
-      - name: Load data to Snowflake
-        if: steps.check-data.outputs.skip == 'false'
+      - name: Run Phase 2 device extraction
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
-          SNOWFLAKE_SCHEMA: ${{ secrets.SNOWFLAKE_SCHEMA }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-        run: npm run load:snowflake
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
+          SKIP_PHASE1: 'true'
+          MAX_DEVICES: ${{ steps.range.outputs.max_devices }}
+          START_PAGE: ${{ steps.range.outputs.start_page }}
+        run: node script.js
+
+      - name: Upload shard logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devices-shard-${{ matrix.shard }}-${{ github.run_id }}
+          path: snowflake.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ============================================
+  # PHASE 2 single-range — manual targeted runs
+  # ============================================
+  devices-single:
+    name: Phase 2 — Devices (single range)
+    if: needs.plan.outputs.mode == 'single-range'
+    runs-on: ubuntu-latest
+    needs: [plan, bulk]
+    environment: dev
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Run Phase 2
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
+          SKIP_PHASE1: 'true'
+          MAX_DEVICES: ${{ github.event.inputs.max_devices }}
+          START_PAGE: ${{ github.event.inputs.start_page }}
+        run: node script.js
+
+      - name: Export ML sample JSON
+        if: success()
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
+        run: node export-rich-devices.js
+
+      - name: Upload ML sample
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-sample-10-devices-${{ github.run_id }}
+          path: output/ml-sample-10-devices.json
+          if-no-files-found: warn
+          retention-days: 30

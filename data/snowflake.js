@@ -14,6 +14,8 @@ function getConnection() {
       password: process.env.SNOWFLAKE_PASSWORD,
       warehouse: process.env.SNOWFLAKE_WAREHOUSE,
       role: process.env.SNOWFLAKE_ROLE,
+      database: DB_NAME,
+      schema: "MEDICAL_DEVICES",
     });
     conn.connect((err, conn) => {
       if (err) {
@@ -65,6 +67,11 @@ async function setupDatabase() {
   await executeSQL(`USE DATABASE ${DB_NAME}`);
   await executeSQL("CREATE SCHEMA IF NOT EXISTS MEDICAL_DEVICES");
   await executeSQL("USE SCHEMA MEDICAL_DEVICES");
+
+  // Drop deprecated tables (pruned — not useful for ML)
+  await executeSQL(`DROP TABLE IF EXISTS DEVICE_RELATED_MEDICINES`);
+  await executeSQL(`DROP TABLE IF EXISTS EMA_MEDICINES`);
+  await executeSQL(`DROP TABLE IF EXISTS COCHRANE_REVIEWS`);
 
   // === DEVICES (main table — flat, queryable columns) ===
   await executeSQL(`
@@ -191,9 +198,15 @@ async function setupDatabase() {
       URL TEXT,
       STATUS VARCHAR(255),
       EVENT_DATE VARCHAR(255),
+      MATCH_CONFIDENCE FLOAT,
+      MATCH_TYPE VARCHAR(100),
+      MATCHED_KEYWORD VARCHAR(1000),
       CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
     )
   `);
+  await executeSQL(`ALTER TABLE DEVICE_ADVERSE_EVENTS ADD COLUMN IF NOT EXISTS MATCH_CONFIDENCE FLOAT`);
+  await executeSQL(`ALTER TABLE DEVICE_ADVERSE_EVENTS ADD COLUMN IF NOT EXISTS MATCH_TYPE VARCHAR(100)`);
+  await executeSQL(`ALTER TABLE DEVICE_ADVERSE_EVENTS ADD COLUMN IF NOT EXISTS MATCHED_KEYWORD VARCHAR(1000)`);
 
   // === CLINICAL EVIDENCE (per device) ===
   await executeSQL(`
@@ -209,26 +222,15 @@ async function setupDatabase() {
       PUBLICATION_DATE VARCHAR(255),
       DOI VARCHAR(500),
       URL TEXT,
+      MATCH_CONFIDENCE FLOAT,
+      MATCH_TYPE VARCHAR(100),
+      MATCHED_KEYWORD VARCHAR(1000),
       CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
     )
   `);
-
-  // === RELATED MEDICINES (per device) ===
-  await executeSQL(`
-    CREATE TABLE IF NOT EXISTS DEVICE_RELATED_MEDICINES (
-      ID NUMBER AUTOINCREMENT PRIMARY KEY,
-      DEVICE_UUID VARCHAR(255),
-      DEVICE_NAME VARCHAR(1000),
-      SOURCE VARCHAR(100),
-      MEDICINE_NAME VARCHAR(1000),
-      ACTIVE_SUBSTANCE VARCHAR(1000),
-      THERAPEUTIC_AREA TEXT,
-      STATUS VARCHAR(255),
-      HOLDER VARCHAR(1000),
-      URL TEXT,
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-  `);
+  await executeSQL(`ALTER TABLE DEVICE_CLINICAL_EVIDENCE ADD COLUMN IF NOT EXISTS MATCH_CONFIDENCE FLOAT`);
+  await executeSQL(`ALTER TABLE DEVICE_CLINICAL_EVIDENCE ADD COLUMN IF NOT EXISTS MATCH_TYPE VARCHAR(100)`);
+  await executeSQL(`ALTER TABLE DEVICE_CLINICAL_EVIDENCE ADD COLUMN IF NOT EXISTS MATCHED_KEYWORD VARCHAR(1000)`);
 
   // === NOTIFIED BODIES ===
   await executeSQL(`
@@ -262,52 +264,6 @@ async function setupDatabase() {
     )
   `);
 
-  // === EMA MEDICINES ===
-  await executeSQL(`
-    CREATE TABLE IF NOT EXISTS EMA_MEDICINES (
-      ID NUMBER AUTOINCREMENT PRIMARY KEY,
-      PRODUCT_ID VARCHAR(500) UNIQUE,
-      MEDICINE_NAME VARCHAR(1000),
-      ACTIVE_SUBSTANCE TEXT,
-      INN_NAME TEXT,
-      ATC_CODE VARCHAR(50),
-      THERAPEUTIC_AREA TEXT,
-      PHARMACOTHERAPEUTIC_GROUP TEXT,
-      THERAPEUTIC_INDICATION TEXT,
-      MEDICINE_STATUS VARCHAR(255),
-      OPINION_STATUS VARCHAR(255),
-      MARKETING_AUTH_HOLDER TEXT,
-      AUTHORIZATION_DATE VARCHAR(255),
-      OPINION_DATE VARCHAR(255),
-      DECISION_DATE VARCHAR(255),
-      IS_BIOSIMILAR BOOLEAN DEFAULT FALSE,
-      IS_GENERIC BOOLEAN DEFAULT FALSE,
-      IS_ORPHAN BOOLEAN DEFAULT FALSE,
-      IS_CONDITIONAL BOOLEAN DEFAULT FALSE,
-      IS_ADVANCED_THERAPY BOOLEAN DEFAULT FALSE,
-      MEDICINE_URL TEXT,
-      RAW_DATA TEXT,
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-  `);
-
-  // === COCHRANE REVIEWS ===
-  await executeSQL(`
-    CREATE TABLE IF NOT EXISTS COCHRANE_REVIEWS (
-      ID NUMBER AUTOINCREMENT PRIMARY KEY,
-      PUBMED_ID VARCHAR(50) UNIQUE,
-      TITLE TEXT,
-      AUTHORS TEXT,
-      JOURNAL VARCHAR(1000),
-      PUBLICATION_DATE VARCHAR(255),
-      DOI VARCHAR(500),
-      SEARCH_TERM VARCHAR(255),
-      URL TEXT,
-      RAW_DATA TEXT,
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
-  `);
-
   // === SAFETY NOTICES (ANSM, SCHEER, etc.) ===
   await executeSQL(`
     CREATE TABLE IF NOT EXISTS SAFETY_NOTICES (
@@ -327,6 +283,91 @@ async function setupDatabase() {
     )
   `);
 
+  // === OPENFDA 510(k) CLEARANCES ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS OPENFDA_510K (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      K_NUMBER VARCHAR(50) UNIQUE,
+      DEVICE_NAME TEXT,
+      APPLICANT VARCHAR(1000),
+      PRODUCT_CODE VARCHAR(50),
+      DECISION_DATE VARCHAR(100),
+      DECISION_DESCRIPTION VARCHAR(500),
+      DATE_RECEIVED VARCHAR(100),
+      STATEMENT_OR_SUMMARY VARCHAR(100),
+      CLEARANCE_TYPE VARCHAR(200),
+      THIRD_PARTY_FLAG VARCHAR(10),
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  // === OPENFDA MAUDE ADVERSE EVENTS ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS OPENFDA_MAUDE (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      MDR_REPORT_KEY VARCHAR(100) UNIQUE,
+      EVENT_TYPE VARCHAR(255),
+      DATE_RECEIVED VARCHAR(100),
+      DATE_OF_EVENT VARCHAR(100),
+      REPORT_SOURCE_CODE VARCHAR(10),
+      DEVICE_NAME TEXT,
+      BRAND_NAME VARCHAR(1000),
+      GENERIC_NAME VARCHAR(1000),
+      MANUFACTURER_NAME VARCHAR(1000),
+      PRODUCT_PROBLEMS TEXT,
+      EVENT_DESCRIPTION TEXT,
+      PATIENT_OUTCOME TEXT,
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  // === CLINICALTRIALS.GOV STUDIES ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS CLINICAL_TRIALS (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      NCT_ID VARCHAR(50) UNIQUE,
+      TITLE TEXT,
+      OFFICIAL_TITLE TEXT,
+      BRIEF_SUMMARY TEXT,
+      CONDITION VARCHAR(2000),
+      INTERVENTION_TYPE VARCHAR(100),
+      INTERVENTION_NAME VARCHAR(2000),
+      SPONSOR VARCHAR(1000),
+      PHASE VARCHAR(100),
+      STATUS VARCHAR(100),
+      STUDY_TYPE VARCHAR(100),
+      PRIMARY_OUTCOME TEXT,
+      ENROLLMENT NUMBER,
+      START_DATE VARCHAR(100),
+      COMPLETION_DATE VARCHAR(100),
+      COUNTRY VARCHAR(500),
+      URL TEXT,
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  // === EUROPE PMC ARTICLES ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS EUROPE_PMC_ARTICLES (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      PMID VARCHAR(50),
+      PMCID VARCHAR(50),
+      DOI VARCHAR(500),
+      TITLE TEXT,
+      ABSTRACT TEXT,
+      AUTHORS TEXT,
+      JOURNAL VARCHAR(1000),
+      PUBLICATION_DATE VARCHAR(100),
+      SEARCH_TERM VARCHAR(500),
+      HAS_FULLTEXT BOOLEAN,
+      URL TEXT,
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
   console.log("Snowflake database setup complete — all tables created");
 }
 
@@ -433,9 +474,10 @@ async function insertDeviceComplete(deviceJSON) {
     ],
   );
 
-  // 2. MANUFACTURERS table
+  // 2. MANUFACTURERS table — use uuid if available, otherwise fall back to srn or name
   const mfr = deviceJSON.manufacturer;
-  if (mfr?.uuid) {
+  if (mfr && (mfr.uuid || mfr.srn || mfr.name)) {
+    const mfrKey = mfr.uuid || mfr.srn || `name:${mfr.name}`;
     await executeSQL(
       `
       MERGE INTO MANUFACTURERS AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
@@ -445,11 +487,11 @@ async function insertDeviceComplete(deviceJSON) {
       VALUES (?,?,?,?,?,?,?,?,?,?)
     `,
       [
-        mfr.uuid,
+        mfrKey,
         // UPDATE binds (9)
         mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
         // INSERT binds (10)
-        mfr.uuid, mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
+        mfrKey, mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
       ],
     );
   }
@@ -527,16 +569,19 @@ async function insertDeviceComplete(deviceJSON) {
       USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
       ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
       WHEN MATCHED THEN UPDATE SET
-        DEVICE_NAME=?, SOURCE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?, STATUS=?, EVENT_DATE=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        DEVICE_NAME=?, SOURCE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?, STATUS=?, EVENT_DATE=?,
+        MATCH_CONFIDENCE=?, MATCH_TYPE=?, MATCHED_KEYWORD=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE, MATCH_CONFIDENCE, MATCH_TYPE, MATCHED_KEYWORD)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `,
       [
         uuid, ae.title,
-        // UPDATE binds (9)
+        // UPDATE binds (12)
         deviceName, ae.source, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
-        // INSERT binds (11)
+        ae.matchConfidence ?? null, ae.matchType ?? null, ae.matchedKeyword ?? null,
+        // INSERT binds (14)
         uuid, deviceName, ae.source, ae.title, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
+        ae.matchConfidence ?? null, ae.matchType ?? null, ae.matchedKeyword ?? null,
       ],
     );
   }
@@ -549,41 +594,23 @@ async function insertDeviceComplete(deviceJSON) {
       USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
       ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
       WHEN MATCHED THEN UPDATE SET
-        DEVICE_NAME=?, SOURCE=?, EVIDENCE_TYPE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
+        DEVICE_NAME=?, SOURCE=?, EVIDENCE_TYPE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?,
+        MATCH_CONFIDENCE=?, MATCH_TYPE=?, MATCHED_KEYWORD=?
+      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, MATCH_CONFIDENCE, MATCH_TYPE, MATCHED_KEYWORD)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
       `,
       [
         uuid, ce.title,
-        // UPDATE binds (8)
+        // UPDATE binds (11)
         deviceName, ce.source, ce.type, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
-        // INSERT binds (10)
+        ce.matchConfidence ?? null, ce.matchType ?? null, ce.matchedKeyword ?? null,
+        // INSERT binds (13)
         uuid, deviceName, ce.source, ce.type, ce.title, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
+        ce.matchConfidence ?? null, ce.matchType ?? null, ce.matchedKeyword ?? null,
       ],
     );
   }
 
-  // 7. RELATED MEDICINES (deduplicate by DEVICE_UUID + MEDICINE_NAME)
-  for (const med of deviceJSON.relatedMedicines || []) {
-    await executeSQL(
-      `
-      MERGE INTO DEVICE_RELATED_MEDICINES AS t
-      USING (SELECT ? AS DEVICE_UUID, ? AS MEDICINE_NAME) AS s
-      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.MEDICINE_NAME = s.MEDICINE_NAME
-      WHEN MATCHED THEN UPDATE SET
-        DEVICE_NAME=?, SOURCE=?, ACTIVE_SUBSTANCE=?, THERAPEUTIC_AREA=?, STATUS=?, HOLDER=?, URL=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, MEDICINE_NAME, ACTIVE_SUBSTANCE, THERAPEUTIC_AREA, STATUS, HOLDER, URL)
-      VALUES (?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid, med.medicineName,
-        // UPDATE binds (7)
-        deviceName, med.source, med.activeSubstance, med.therapeuticArea, med.status, med.holder, med.url,
-        // INSERT binds (9)
-        uuid, deviceName, med.source, med.medicineName, med.activeSubstance, med.therapeuticArea, med.status, med.holder, med.url,
-      ],
-    );
-  }
 }
 
 async function insertNotifiedBody(nb) {
@@ -634,49 +661,6 @@ async function insertRefusedApplication(app) {
   );
 }
 
-async function insertEMAMedicine(med) {
-  await useDB();
-  const id = med.ema_product_number || med.name_of_medicine;
-  await executeSQL(
-    `
-    MERGE INTO EMA_MEDICINES AS t USING (SELECT ? AS PRODUCT_ID) AS s ON t.PRODUCT_ID = s.PRODUCT_ID
-    WHEN MATCHED THEN UPDATE SET
-      MEDICINE_NAME=?, ACTIVE_SUBSTANCE=?, INN_NAME=?, ATC_CODE=?, THERAPEUTIC_AREA=?, PHARMACOTHERAPEUTIC_GROUP=?, THERAPEUTIC_INDICATION=?, MEDICINE_STATUS=?, OPINION_STATUS=?, MARKETING_AUTH_HOLDER=?, AUTHORIZATION_DATE=?, OPINION_DATE=?, DECISION_DATE=?, IS_BIOSIMILAR=?, IS_GENERIC=?, IS_ORPHAN=?, IS_CONDITIONAL=?, IS_ADVANCED_THERAPY=?, MEDICINE_URL=?, RAW_DATA=?
-    WHEN NOT MATCHED THEN INSERT (PRODUCT_ID, MEDICINE_NAME, ACTIVE_SUBSTANCE, INN_NAME, ATC_CODE, THERAPEUTIC_AREA, PHARMACOTHERAPEUTIC_GROUP, THERAPEUTIC_INDICATION, MEDICINE_STATUS, OPINION_STATUS, MARKETING_AUTH_HOLDER, AUTHORIZATION_DATE, OPINION_DATE, DECISION_DATE, IS_BIOSIMILAR, IS_GENERIC, IS_ORPHAN, IS_CONDITIONAL, IS_ADVANCED_THERAPY, MEDICINE_URL, RAW_DATA)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    `,
-    [
-      id,
-      // UPDATE binds (20)
-      med.name_of_medicine, med.active_substance, med.international_non_proprietary_name_common_name, med.atc_code_human, med.therapeutic_area_mesh, med.pharmacotherapeutic_group_human, med.therapeutic_indication, med.medicine_status, med.opinion_status, med.marketing_authorisation_developer_applicant_holder, med.marketing_authorisation_date, med.opinion_adopted_date, med.european_commission_decision_date, med.biosimilar === "Yes", med.generic === "Yes", med.orphan_medicine === "Yes", med.conditional_approval === "Yes", med.advanced_therapy === "Yes", med.medicine_url, JSON.stringify(med),
-      // INSERT binds (21)
-      id, med.name_of_medicine, med.active_substance, med.international_non_proprietary_name_common_name, med.atc_code_human, med.therapeutic_area_mesh, med.pharmacotherapeutic_group_human, med.therapeutic_indication, med.medicine_status, med.opinion_status, med.marketing_authorisation_developer_applicant_holder, med.marketing_authorisation_date, med.opinion_adopted_date, med.european_commission_decision_date, med.biosimilar === "Yes", med.generic === "Yes", med.orphan_medicine === "Yes", med.conditional_approval === "Yes", med.advanced_therapy === "Yes", med.medicine_url, JSON.stringify(med),
-    ],
-  );
-}
-
-async function insertCochraneReview(review) {
-  await useDB();
-  const id = `pubmed_${review.uid}`;
-  const authors = review.authors?.map((a) => a.name).join(", ") || "";
-  await executeSQL(
-    `
-    MERGE INTO COCHRANE_REVIEWS AS t USING (SELECT ? AS PUBMED_ID) AS s ON t.PUBMED_ID = s.PUBMED_ID
-    WHEN MATCHED THEN UPDATE SET
-      TITLE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, SEARCH_TERM=?, URL=?, RAW_DATA=?
-    WHEN NOT MATCHED THEN INSERT (PUBMED_ID, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, SEARCH_TERM, URL, RAW_DATA)
-    VALUES (?,?,?,?,?,?,?,?,?)
-    `,
-    [
-      id,
-      // UPDATE binds (8)
-      review.title, authors, review.fulljournalname, review.pubdate || review.sortpubdate, review.elocationid, review.searchTerm, `https://pubmed.ncbi.nlm.nih.gov/${review.uid}/`, JSON.stringify(review),
-      // INSERT binds (9)
-      id, review.title, authors, review.fulljournalname, review.pubdate || review.sortpubdate, review.elocationid, review.searchTerm, `https://pubmed.ncbi.nlm.nih.gov/${review.uid}/`, JSON.stringify(review),
-    ],
-  );
-}
-
 async function insertSafetyNotice(source, record) {
   await useDB();
   const sourceId = `${source}_${(record.deviceName || record.title || "").substring(0, 200)}_${record.updateDate || record.date || ""}`;
@@ -694,6 +678,90 @@ async function insertSafetyNotice(source, record) {
       source, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
       // INSERT binds (11)
       source, sourceId, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
+    ],
+  );
+}
+
+async function insertOpenFDA510k(r) {
+  await executeSQL(
+    `MERGE INTO OPENFDA_510K AS t USING (SELECT ? AS K_NUMBER) AS s ON t.K_NUMBER = s.K_NUMBER
+     WHEN MATCHED THEN UPDATE SET DEVICE_NAME=?, APPLICANT=?, PRODUCT_CODE=?, DECISION_DATE=?, DECISION_DESCRIPTION=?, DATE_RECEIVED=?, STATEMENT_OR_SUMMARY=?, CLEARANCE_TYPE=?, THIRD_PARTY_FLAG=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (K_NUMBER, DEVICE_NAME, APPLICANT, PRODUCT_CODE, DECISION_DATE, DECISION_DESCRIPTION, DATE_RECEIVED, STATEMENT_OR_SUMMARY, CLEARANCE_TYPE, THIRD_PARTY_FLAG, RAW_DATA)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      r.k_number,
+      r.device_name, r.applicant, r.product_code, r.decision_date, r.decision_description, r.date_received, r.statement_or_summary, r.clearance_type, r.third_party_flag, JSON.stringify(r),
+      r.k_number, r.device_name, r.applicant, r.product_code, r.decision_date, r.decision_description, r.date_received, r.statement_or_summary, r.clearance_type, r.third_party_flag, JSON.stringify(r),
+    ],
+  );
+}
+
+async function insertOpenFDAMaude(r) {
+  const key = r.mdr_report_key || r.report_number;
+  if (!key) return;
+  const device = (r.device || [])[0] || {};
+  const products = (r.product_problems || []).join("; ") || null;
+  const mdrText = (r.mdr_text || []).map(t => t.text).filter(Boolean).join(" | ").substring(0, 5000);
+  await executeSQL(
+    `MERGE INTO OPENFDA_MAUDE AS t USING (SELECT ? AS MDR_REPORT_KEY) AS s ON t.MDR_REPORT_KEY = s.MDR_REPORT_KEY
+     WHEN MATCHED THEN UPDATE SET EVENT_TYPE=?, DATE_RECEIVED=?, DATE_OF_EVENT=?, REPORT_SOURCE_CODE=?, DEVICE_NAME=?, BRAND_NAME=?, GENERIC_NAME=?, MANUFACTURER_NAME=?, PRODUCT_PROBLEMS=?, EVENT_DESCRIPTION=?, PATIENT_OUTCOME=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (MDR_REPORT_KEY, EVENT_TYPE, DATE_RECEIVED, DATE_OF_EVENT, REPORT_SOURCE_CODE, DEVICE_NAME, BRAND_NAME, GENERIC_NAME, MANUFACTURER_NAME, PRODUCT_PROBLEMS, EVENT_DESCRIPTION, PATIENT_OUTCOME, RAW_DATA)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      key,
+      r.event_type, r.date_received, r.date_of_event, r.report_source_code, device.generic_name || device.brand_name, device.brand_name, device.generic_name, device.manufacturer_d_name || r.manufacturer_name, products, mdrText, ((r.patient || [])[0]?.patient_outcome || []).join(", "), JSON.stringify(r),
+      key, r.event_type, r.date_received, r.date_of_event, r.report_source_code, device.generic_name || device.brand_name, device.brand_name, device.generic_name, device.manufacturer_d_name || r.manufacturer_name, products, mdrText, ((r.patient || [])[0]?.patient_outcome || []).join(", "), JSON.stringify(r),
+    ],
+  );
+}
+
+async function insertClinicalTrial(r) {
+  const p = r.protocolSection || r;
+  const nctId = p.identificationModule?.nctId || r.nct_id;
+  if (!nctId) return;
+  const title = p.identificationModule?.briefTitle || null;
+  const officialTitle = p.identificationModule?.officialTitle || null;
+  const briefSummary = p.descriptionModule?.briefSummary || null;
+  const condition = (p.conditionsModule?.conditions || []).join("; ") || null;
+  const interventions = p.armsInterventionsModule?.interventions || [];
+  const interventionType = interventions.map(i => i.type).filter(Boolean).join(", ") || null;
+  const interventionName = interventions.map(i => i.name).filter(Boolean).join("; ") || null;
+  const sponsor = p.sponsorCollaboratorsModule?.leadSponsor?.name || null;
+  const phase = (p.designModule?.phases || []).join(", ") || null;
+  const status = p.statusModule?.overallStatus || null;
+  const studyType = p.designModule?.studyType || null;
+  const primaryOutcome = (p.outcomesModule?.primaryOutcomes || []).map(o => o.measure).filter(Boolean).join("; ") || null;
+  const enrollment = p.designModule?.enrollmentInfo?.count || null;
+  const startDate = p.statusModule?.startDateStruct?.date || null;
+  const completionDate = p.statusModule?.completionDateStruct?.date || null;
+  const countries = [...new Set((p.contactsLocationsModule?.locations || []).map(l => l.country))].filter(Boolean).join(", ") || null;
+  await executeSQL(
+    `MERGE INTO CLINICAL_TRIALS AS t USING (SELECT ? AS NCT_ID) AS s ON t.NCT_ID = s.NCT_ID
+     WHEN MATCHED THEN UPDATE SET TITLE=?, OFFICIAL_TITLE=?, BRIEF_SUMMARY=?, CONDITION=?, INTERVENTION_TYPE=?, INTERVENTION_NAME=?, SPONSOR=?, PHASE=?, STATUS=?, STUDY_TYPE=?, PRIMARY_OUTCOME=?, ENROLLMENT=?, START_DATE=?, COMPLETION_DATE=?, COUNTRY=?, URL=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (NCT_ID, TITLE, OFFICIAL_TITLE, BRIEF_SUMMARY, CONDITION, INTERVENTION_TYPE, INTERVENTION_NAME, SPONSOR, PHASE, STATUS, STUDY_TYPE, PRIMARY_OUTCOME, ENROLLMENT, START_DATE, COMPLETION_DATE, COUNTRY, URL, RAW_DATA)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      nctId,
+      title, officialTitle, briefSummary, condition, interventionType, interventionName, sponsor, phase, status, studyType, primaryOutcome, enrollment, startDate, completionDate, countries, `https://clinicaltrials.gov/study/${nctId}`, JSON.stringify(r),
+      nctId, title, officialTitle, briefSummary, condition, interventionType, interventionName, sponsor, phase, status, studyType, primaryOutcome, enrollment, startDate, completionDate, countries, `https://clinicaltrials.gov/study/${nctId}`, JSON.stringify(r),
+    ],
+  );
+}
+
+async function insertEuropePmc(r) {
+  const pmid = r.pmid || null;
+  const pmcid = r.pmcid || null;
+  const key = pmid || pmcid || r.id;
+  if (!key) return;
+  await executeSQL(
+    `MERGE INTO EUROPE_PMC_ARTICLES AS t USING (SELECT ? AS PMID, ? AS PMCID) AS s ON (t.PMID = s.PMID AND s.PMID IS NOT NULL) OR (t.PMCID = s.PMCID AND s.PMCID IS NOT NULL)
+     WHEN MATCHED THEN UPDATE SET DOI=?, TITLE=?, ABSTRACT=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, SEARCH_TERM=?, HAS_FULLTEXT=?, URL=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (PMID, PMCID, DOI, TITLE, ABSTRACT, AUTHORS, JOURNAL, PUBLICATION_DATE, SEARCH_TERM, HAS_FULLTEXT, URL, RAW_DATA)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      pmid, pmcid,
+      r.doi, r.title, r.abstractText, r.authorString, r.journalTitle, r.firstPublicationDate, r.searchTerm, r.hasFullText === "Y", pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : (pmcid ? `https://europepmc.org/article/PMC/${pmcid}` : null), JSON.stringify(r),
+      pmid, pmcid, r.doi, r.title, r.abstractText, r.authorString, r.journalTitle, r.firstPublicationDate, r.searchTerm, r.hasFullText === "Y", pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : (pmcid ? `https://europepmc.org/article/PMC/${pmcid}` : null), JSON.stringify(r),
     ],
   );
 }
@@ -725,9 +793,11 @@ module.exports = {
   insertDeviceComplete,
   insertNotifiedBody,
   insertRefusedApplication,
-  insertEMAMedicine,
-  insertCochraneReview,
   insertSafetyNotice,
+  insertOpenFDA510k,
+  insertOpenFDAMaude,
+  insertClinicalTrial,
+  insertEuropePmc,
   getTableCount,
   closeConnection,
 };
