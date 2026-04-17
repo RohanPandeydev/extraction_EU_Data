@@ -110,7 +110,6 @@ function buildDeviceJSON(basic, detail) {
 let bulkData = {
   ansm: [], cochrane: [], scheer: [], ema: [],
   bfarm: [], aemps: [], igj: [], iss: [],
-  openfdaRecalls: [], openfdaMaude: [],
   clinicalTrials: [], europePmc: [],
 };
 
@@ -213,28 +212,6 @@ function findAdverseEvents(deviceName, manufacturerName, tradeName) {
     if (m.score > 0) results.push({
       source: "ISS (Italy)", title: r.title, status: r.recallType || "Safety Info",
       date: r.recallDate, type: "Safety Information", url: r.sourceUrl,
-      matchConfidence: m.score, matchType: m.matchType, matchedKeyword: m.matchedKeyword,
-    });
-  }
-  for (const r of bulkData.openfdaRecalls) {
-    const m = scoreMatch(`${r.productDescription || ""} ${r.brandName || ""} ${r.recallingFirm || ""}`, ctx);
-    if (m.score > 0) results.push({
-      source: "openFDA Recalls (US)", title: r.productDescription || r.brandName,
-      status: r.recallStatus, date: r.datePosted || r.dateInitiated,
-      type: r.classification || "Recall",
-      url: r.cfresId ? `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfres/res.cfm?id=${r.cfresId}` : null,
-      matchConfidence: m.score, matchType: m.matchType, matchedKeyword: m.matchedKeyword,
-    });
-  }
-  for (const r of bulkData.openfdaMaude) {
-    const device = (r.device || [])[0] || {};
-    const searchText = `${device.generic_name || ""} ${device.brand_name || ""} ${device.manufacturer_d_name || ""}`;
-    const m = scoreMatch(searchText, ctx);
-    if (m.score > 0) results.push({
-      source: "openFDA MAUDE (US)", title: device.generic_name || device.brand_name,
-      status: r.event_type, date: r.date_received,
-      type: r.event_type || "Adverse Event",
-      url: r.mdr_report_key ? `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfmaude/detail.cfm?mdrfoi__id=${r.mdr_report_key}` : null,
       matchConfidence: m.score, matchType: m.matchType, matchedKeyword: m.matchedKeyword,
     });
   }
@@ -684,71 +661,7 @@ async function runBulkScrapers() {
     results.push({ name: "ISS", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< ISS FAILED: ${e.message}`); results.push({ name: "ISS", status: "FAILED", error: e.message }); }
 
-  // 11. openFDA Device Recalls (US — matches EU manufacturers with US market presence)
-  log("BULK", ">>> openFDA Device Recalls (US)");
-  try {
-    const records = [];
-    const maxPages = process.env.OPENFDA_MAX_PAGES ? parseInt(process.env.OPENFDA_MAX_PAGES) : 10;
-    for (let page = 0; page < maxPages; page++) {
-      const data = await fetchJSON(`https://api.fda.gov/device/recall.json?limit=100&skip=${page * 100}&sort=event_date_posted:desc`, { headers: { "User-Agent": "eudamed-extraction/1.0" } });
-      if (!data.results || data.results.length === 0) break;
-      for (const recall of data.results) {
-        const products = recall.products || [];
-        const record = {
-          source: "openFDA", cfresId: recall.cfres_id, productDescription: products[0]?.product_description || null,
-          brandName: products[0]?.brand_name || null, recallingFirm: recall.recalling_firm || null,
-          dateInitiated: recall.event_date_initiated || null, datePosted: recall.event_date_posted || null,
-          recallStatus: recall.recall_status || null, classification: recall.classification || null,
-          reasonForRecall: recall.reason_for_recall || null, country: recall.country || null,
-        };
-        records.push(record);
-      }
-      await sleep(300, 500);
-    }
-    for (const r of records) {
-      await insertSafetyNotice("OPENFDA", {
-        title: r.productDescription || r.brandName, deviceName: r.productDescription || r.brandName,
-        deviceType: r.classification, status: r.recallStatus, updateDate: r.datePosted,
-        url: r.cfresId ? `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfres/res.cfm?id=${r.cfresId}` : null,
-        topic: r.reasonForRecall || null,
-      });
-    }
-    bulkData.openfdaRecalls = records;
-    log("BULK", `<<< openFDA Recalls: ${records.length} -> Snowflake`);
-    results.push({ name: "openFDA Recalls", status: "SUCCESS" });
-  } catch (e) { log("BULK", `<<< openFDA Recalls FAILED: ${e.message}`); results.push({ name: "openFDA Recalls", status: "FAILED", error: e.message }); }
-
-  // 12. openFDA MAUDE Adverse Events
-  log("BULK", ">>> openFDA MAUDE Adverse Events");
-  try {
-    const records = [];
-    const maxPages = process.env.OPENFDA_MAUDE_PAGES ? parseInt(process.env.OPENFDA_MAUDE_PAGES) : 10;
-    for (let page = 0; page < maxPages; page++) {
-      const data = await fetchJSON(`https://api.fda.gov/device/event.json?limit=100&skip=${page * 100}&sort=date_received:desc`, { headers: { "User-Agent": "eudamed-extraction/1.0" } });
-      if (!data.results || data.results.length === 0) break;
-      for (const event of data.results) records.push(event);
-      await sleep(300, 500);
-    }
-    for (const r of records) {
-      const device = (r.device || [])[0] || {};
-      const key = r.mdr_report_key || r.report_number;
-      if (!key) continue;
-      await insertSafetyNotice("OPENFDA_MAUDE", {
-        title: device.generic_name || device.brand_name,
-        deviceName: device.generic_name || device.brand_name,
-        deviceType: r.event_type,
-        status: r.event_type,
-        updateDate: r.date_received,
-        topic: (r.product_problems || []).join("; ") || null,
-        url: `https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfmaude/detail.cfm?mdrfoi__id=${key}`,
-      });
-    }
-    bulkData.openfdaMaude = records;
-    log("BULK", `<<< openFDA MAUDE: ${records.length} -> SAFETY_NOTICES (source=OPENFDA_MAUDE)`);
-    results.push({ name: "openFDA MAUDE", status: "SUCCESS" });
-  } catch (e) { log("BULK", `<<< openFDA MAUDE FAILED: ${e.message}`); results.push({ name: "openFDA MAUDE", status: "FAILED", error: e.message }); }
-
-  // 14. ClinicalTrials.gov (device interventional studies)
+  // ClinicalTrials.gov (device interventional studies)
   log("BULK", ">>> ClinicalTrials.gov (device interventional studies)");
   try {
     const records = [];

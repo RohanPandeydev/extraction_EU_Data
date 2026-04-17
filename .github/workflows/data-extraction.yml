@@ -152,8 +152,6 @@ jobs:
           SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
           SNOWFLAKE_DB: ${{ secrets.SNOWFLAKE_DB }}
           SKIP_PHASE2: 'true'
-          OPENFDA_MAX_PAGES: '50'
-          OPENFDA_MAUDE_PAGES: '50'
           CTGOV_PAGES: '20'
         run: node script.js
 
