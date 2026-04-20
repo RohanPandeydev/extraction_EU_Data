@@ -4,6 +4,7 @@ const { fetchJSON, fetchHTML } = require("./utils/httpClient");
 const {
   setupDatabase, insertDeviceComplete, insertNotifiedBody,
   insertRefusedApplication, insertSafetyNotice,
+  insertMHRAAlert, insertEUManufacturer,
   insertClinicalTrial, insertEuropePmc,
   getTableCount, closeConnection,
 } = require("./data/snowflake");
@@ -707,6 +708,103 @@ async function runBulkScrapers() {
     results.push({ name: "Europe PMC", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< Europe PMC FAILED: ${e.message}`); results.push({ name: "Europe PMC", status: "FAILED", error: e.message }); }
 
+  // 16. MHRA UK Device Alerts + EU Manufacturer Registry (linked)
+  log("BULK", ">>> MHRA UK Device Alerts + EU Manufacturer Registry");
+  try {
+    const BRANDS = [
+      "Philips", "Medtronic", "Abbott", "Boston Scientific", "Baxter",
+      "B. Braun", "Siemens Healthineers", "GE HealthCare", "Stryker",
+      "Becton Dickinson", "Smiths Medical", "Roche Diagnostics",
+      "Johnson", "Olympus", "Fresenius", "Terumo", "Hologic", "Zimmer",
+      "Edwards Lifesciences", "Cook Medical", "Cardinal Health", "3M",
+    ];
+
+    const PROBLEM_PATTERNS = [
+      { m: /alarm (malfunction|failure|silent)/i, l: "Alarm malfunction" },
+      { m: /battery (failure|issue|degradation|depletion)/i, l: "Battery failure" },
+      { m: /software (bug|error|issue|defect|anomaly|update)/i, l: "Software defect" },
+      { m: /electrical (fault|failure|short)/i, l: "Electrical fault" },
+      { m: /mechanical (failure|fault|breakage|fracture)/i, l: "Mechanical failure" },
+      { m: /foam (degradation|particle)/i, l: "Foam degradation" },
+      { m: /insulin (delivery|leak)/i, l: "Insulin delivery issue" },
+      { m: /contamination|contaminated/i, l: "Contamination" },
+      { m: /labelling error|mislabel/i, l: "Labelling error" },
+      { m: /death|fatality/i, l: "Death reported" },
+      { m: /serious injury|patient harm|adverse event/i, l: "Patient harm reported" },
+      { m: /recall|withdraw/i, l: "Recall" },
+      { m: /leak(age|ing)?/i, l: "Leak" },
+      { m: /overheat/i, l: "Overheating" },
+      { m: /sterilisation|sterilization/i, l: "Sterilisation issue" },
+    ];
+
+    const extractProblems = (text) => {
+      const hits = [];
+      for (const p of PROBLEM_PATTERNS) if (p.m.test(text)) hits.push(p.l);
+      return [...new Set(hits)];
+    };
+
+    const fetchMHRADetail = async (link) => {
+      try {
+        const res = await fetch(`https://www.gov.uk${link}`, { signal: AbortSignal.timeout(20000) });
+        if (!res.ok) return null;
+        const html = await res.text();
+        const main = html.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+        return (main?.[1] || "").replace(/<script[\s\S]*?<\/script>/g, "").replace(/<style[\s\S]*?<\/style>/g, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().substring(0, 3000);
+      } catch { return null; }
+    };
+
+    let totalAlerts = 0, totalManufacturers = 0;
+    for (const brand of BRANDS) {
+      // 1. Fetch EUDAMED manufacturers for this brand
+      const eosData = await fetchJSON(`https://ec.europa.eu/tools/eudamed/api/eos?page=0&pageSize=20&languageIso2Code=en&name=${encodeURIComponent(brand)}`, { headers: { Accept: "application/json" } }).catch(() => null);
+      const manufacturers = (eosData?.content || []).filter(a => a.actorType?.code === "refdata.actor-type.manufacturer");
+      for (const m of manufacturers) {
+        await insertEUManufacturer({ ...m, brand });
+        totalManufacturers++;
+      }
+      const primaryMfg = manufacturers[0] || null;
+
+      // 2. Fetch MHRA alerts for this brand
+      const brandKey = brand.split(/\s/)[0].toLowerCase();
+      const mhraData = await fetchJSON(`https://www.gov.uk/api/search.json?q=${encodeURIComponent(brand)}&filter_organisations=medicines-and-healthcare-products-regulatory-agency&count=30`, {}).catch(() => null);
+      const rawAlerts = (mhraData?.results || []).filter(a =>
+        a.title && a.title.length > 15 &&
+        a.title.toLowerCase().includes(brandKey) &&
+        !a.title.match(/^(Medical Device Alerts|Field Safety Notices|Letters and medicine recalls|MHRA Safety Roundup)/i) &&
+        !a.title.match(/(issued in|archived in|summary list)/i)
+      );
+
+      for (const a of rawAlerts.slice(0, 5)) {
+        const detail = await fetchMHRADetail(a.link);
+        const combined = `${a.title || ""} ${a.description || ""} ${detail || ""}`;
+        await insertMHRAAlert({
+          alertId: a.link,
+          brand,
+          manufacturerSrn: primaryMfg?.srn || null,
+          manufacturerName: primaryMfg?.name || null,
+          manufacturerCountry: primaryMfg?.countryName || null,
+          title: a.title,
+          description: a.description,
+          fullContent: detail?.substring(0, 2000) || null,
+          publishedDate: a.public_timestamp,
+          alertType: a.format,
+          url: `https://www.gov.uk${a.link}`,
+          problemCategories: extractProblems(combined),
+          mentionsPatientHarm: /(death|serious injury|hospitali[sz]ation|patient (harm|injury))/i.test(combined),
+          mentionsRecall: /(recall|withdraw)/i.test(combined),
+          mentionsSoftware: /software/i.test(combined),
+        });
+        totalAlerts++;
+        await sleep(400, 200);
+      }
+      log("BULK", `  ${brand}: ${manufacturers.length} EU mfg records, ${rawAlerts.slice(0, 5).length} MHRA alerts`);
+      await sleep(500, 300);
+    }
+
+    log("BULK", `<<< MHRA + EU Manufacturers: ${totalAlerts} alerts, ${totalManufacturers} manufacturers -> Snowflake`);
+    results.push({ name: "MHRA + EU Manufacturers", status: "SUCCESS" });
+  } catch (e) { log("BULK", `<<< MHRA + EU Manufacturers FAILED: ${e.message}`); results.push({ name: "MHRA + EU Manufacturers", status: "FAILED", error: e.message }); }
+
   return results;
 }
 
@@ -791,7 +889,7 @@ async function main() {
   // Final stats
   console.log("");
   log("MAIN", "====== Final Snowflake Stats ======");
-  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES"];
+  const tables = ["DEVICES", "MANUFACTURERS", "AUTHORISED_REPRESENTATIVES", "DEVICE_CERTIFICATES", "DEVICE_ADVERSE_EVENTS", "DEVICE_CLINICAL_EVIDENCE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES", "CLINICAL_TRIALS", "EUROPE_PMC_ARTICLES", "MHRA_ALERTS", "EU_MANUFACTURERS"];
   for (const t of tables) { const c = await getTableCount(t); log("MAIN", `  ${t}: ${c} rows`); }
 
   console.log("");

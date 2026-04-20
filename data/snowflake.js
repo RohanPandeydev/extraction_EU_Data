@@ -313,6 +313,56 @@ async function setupDatabase() {
     )
   `);
 
+  // === MHRA DEVICE ALERTS (UK — with rich narrative + derived quality fields) ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS MHRA_ALERTS (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      ALERT_ID VARCHAR(1000) UNIQUE,
+      BRAND VARCHAR(500),
+      MANUFACTURER_SRN VARCHAR(100),
+      MANUFACTURER_NAME VARCHAR(1000),
+      MANUFACTURER_COUNTRY VARCHAR(255),
+      TITLE TEXT,
+      DESCRIPTION TEXT,
+      FULL_CONTENT TEXT,
+      PUBLISHED_DATE VARCHAR(100),
+      ALERT_TYPE VARCHAR(100),
+      URL TEXT,
+      PROBLEM_CATEGORIES TEXT,
+      MENTIONS_PATIENT_HARM BOOLEAN,
+      MENTIONS_RECALL BOOLEAN,
+      MENTIONS_SOFTWARE BOOLEAN,
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
+  // === EU MANUFACTURER REGISTRY (from EUDAMED /api/eos) ===
+  await executeSQL(`
+    CREATE TABLE IF NOT EXISTS EU_MANUFACTURERS (
+      ID NUMBER AUTOINCREMENT PRIMARY KEY,
+      SRN VARCHAR(100) UNIQUE,
+      UUID VARCHAR(255),
+      NAME VARCHAR(1000),
+      ABBREVIATED_NAME VARCHAR(500),
+      BRAND VARCHAR(500),
+      ACTOR_TYPE VARCHAR(100),
+      STATUS VARCHAR(100),
+      COUNTRY_ISO2 VARCHAR(10),
+      COUNTRY_NAME VARCHAR(255),
+      COUNTRY_TYPE VARCHAR(50),
+      GEOGRAPHICAL_ADDRESS TEXT,
+      CITY_NAME VARCHAR(255),
+      POSTAL_ZONE VARCHAR(50),
+      ELECTRONIC_MAIL VARCHAR(500),
+      TELEPHONE VARCHAR(100),
+      DATE_OF_REGISTRATION VARCHAR(100),
+      VERSION_NUMBER NUMBER,
+      RAW_DATA TEXT,
+      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    )
+  `);
+
   // === EUROPE PMC ARTICLES ===
   await executeSQL(`
     CREATE TABLE IF NOT EXISTS EUROPE_PMC_ARTICLES (
@@ -646,6 +696,62 @@ async function insertSafetyNotice(source, record) {
   );
 }
 
+async function insertMHRAAlert(a) {
+  if (!a.alertId) return;
+  await executeSQL(
+    `MERGE INTO MHRA_ALERTS AS t USING (SELECT ? AS ALERT_ID) AS s ON t.ALERT_ID = s.ALERT_ID
+     WHEN MATCHED THEN UPDATE SET
+       BRAND=?, MANUFACTURER_SRN=?, MANUFACTURER_NAME=?, MANUFACTURER_COUNTRY=?,
+       TITLE=?, DESCRIPTION=?, FULL_CONTENT=?, PUBLISHED_DATE=?, ALERT_TYPE=?, URL=?,
+       PROBLEM_CATEGORIES=?, MENTIONS_PATIENT_HARM=?, MENTIONS_RECALL=?, MENTIONS_SOFTWARE=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (
+       ALERT_ID, BRAND, MANUFACTURER_SRN, MANUFACTURER_NAME, MANUFACTURER_COUNTRY,
+       TITLE, DESCRIPTION, FULL_CONTENT, PUBLISHED_DATE, ALERT_TYPE, URL,
+       PROBLEM_CATEGORIES, MENTIONS_PATIENT_HARM, MENTIONS_RECALL, MENTIONS_SOFTWARE, RAW_DATA
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      a.alertId,
+      a.brand, a.manufacturerSrn, a.manufacturerName, a.manufacturerCountry,
+      a.title, a.description, a.fullContent, a.publishedDate, a.alertType, a.url,
+      JSON.stringify(a.problemCategories || []), !!a.mentionsPatientHarm, !!a.mentionsRecall, !!a.mentionsSoftware,
+      JSON.stringify(a),
+      a.alertId, a.brand, a.manufacturerSrn, a.manufacturerName, a.manufacturerCountry,
+      a.title, a.description, a.fullContent, a.publishedDate, a.alertType, a.url,
+      JSON.stringify(a.problemCategories || []), !!a.mentionsPatientHarm, !!a.mentionsRecall, !!a.mentionsSoftware,
+      JSON.stringify(a),
+    ],
+  );
+}
+
+async function insertEUManufacturer(m) {
+  if (!m.srn) return;
+  await executeSQL(
+    `MERGE INTO EU_MANUFACTURERS AS t USING (SELECT ? AS SRN) AS s ON t.SRN = s.SRN
+     WHEN MATCHED THEN UPDATE SET
+       UUID=?, NAME=?, ABBREVIATED_NAME=?, BRAND=?, ACTOR_TYPE=?, STATUS=?,
+       COUNTRY_ISO2=?, COUNTRY_NAME=?, COUNTRY_TYPE=?, GEOGRAPHICAL_ADDRESS=?,
+       CITY_NAME=?, POSTAL_ZONE=?, ELECTRONIC_MAIL=?, TELEPHONE=?,
+       DATE_OF_REGISTRATION=?, VERSION_NUMBER=?, RAW_DATA=?
+     WHEN NOT MATCHED THEN INSERT (
+       SRN, UUID, NAME, ABBREVIATED_NAME, BRAND, ACTOR_TYPE, STATUS,
+       COUNTRY_ISO2, COUNTRY_NAME, COUNTRY_TYPE, GEOGRAPHICAL_ADDRESS,
+       CITY_NAME, POSTAL_ZONE, ELECTRONIC_MAIL, TELEPHONE,
+       DATE_OF_REGISTRATION, VERSION_NUMBER, RAW_DATA
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      m.srn,
+      m.uuid, m.name, m.abbreviatedName, m.brand, m.actorType?.code?.split(".").pop(), m.actorStatus?.code?.split(".").pop(),
+      m.countryIso2Code, m.countryName, m.countryType, m.geographicalAddress,
+      m.cityName, m.postalZone, m.electronicMail, m.telephone,
+      m.dateOfRegistration, m.versionNumber, JSON.stringify(m),
+      m.srn, m.uuid, m.name, m.abbreviatedName, m.brand, m.actorType?.code?.split(".").pop(), m.actorStatus?.code?.split(".").pop(),
+      m.countryIso2Code, m.countryName, m.countryType, m.geographicalAddress,
+      m.cityName, m.postalZone, m.electronicMail, m.telephone,
+      m.dateOfRegistration, m.versionNumber, JSON.stringify(m),
+    ],
+  );
+}
+
 async function insertClinicalTrial(r) {
   const p = r.protocolSection || r;
   const nctId = p.identificationModule?.nctId || r.nct_id;
@@ -725,6 +831,8 @@ module.exports = {
   insertNotifiedBody,
   insertRefusedApplication,
   insertSafetyNotice,
+  insertMHRAAlert,
+  insertEUManufacturer,
   insertClinicalTrial,
   insertEuropePmc,
   getTableCount,
