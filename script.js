@@ -2,10 +2,11 @@ const { getAllHeaders } = require("./headers");
 const { sleep } = require("./utils/rateLimiter");
 const { fetchJSON, fetchHTML } = require("./utils/httpClient");
 const {
-  setupDatabase, insertDeviceComplete, insertNotifiedBody,
-  insertRefusedApplication, insertSafetyNotice,
-  insertMHRAAlert, insertEUManufacturer,
-  insertClinicalTrial, insertEuropePmc,
+  setupDatabase, insertDeviceComplete,
+  insertNotifiedBodiesBatch, insertRefusedApplicationsBatch,
+  insertSafetyNoticesBatch, insertMHRAAlertsBatch,
+  insertEUManufacturersBatch, insertClinicalTrialsBatch,
+  insertEuropePmcBatch,
   getTableCount, closeConnection,
 } = require("./data/snowflake");
 
@@ -434,7 +435,7 @@ async function runBulkScrapers() {
   log("BULK", ">>> EUDAMED Notified Bodies");
   try {
     const nbData = await fetchJSON("https://ec.europa.eu/tools/eudamed/api/ses/notifiedBodies", { headers: await getAllHeaders() });
-    for (const nb of (Array.isArray(nbData) ? nbData : [])) await insertNotifiedBody(nb);
+    await insertNotifiedBodiesBatch(Array.isArray(nbData) ? nbData : []);
     log("BULK", `<<< Notified Bodies: ${Array.isArray(nbData) ? nbData.length : 0} -> Snowflake`);
     results.push({ name: "Notified Bodies", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< Notified Bodies FAILED: ${e.message}`); results.push({ name: "Notified Bodies", status: "FAILED", error: e.message }); }
@@ -452,7 +453,7 @@ async function runBulkScrapers() {
       page++;
       await sleep(2000, 1000);
     }
-    for (const app of allApps) await insertRefusedApplication(app);
+    await insertRefusedApplicationsBatch(allApps);
     log("BULK", `<<< Refused Applications: ${allApps.length} -> Snowflake`);
     results.push({ name: "Refused Applications", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< Refused Applications FAILED: ${e.message}`); results.push({ name: "Refused Applications", status: "FAILED", error: e.message }); }
@@ -507,7 +508,7 @@ async function runBulkScrapers() {
         records.push(record);
       }
     });
-    for (const r of records) await insertSafetyNotice("ANSM", r);
+    await insertSafetyNoticesBatch("ANSM", records);
     bulkData.ansm = records;
     log("BULK", `<<< ANSM: ${records.length} -> Snowflake`);
     results.push({ name: "ANSM", status: "SUCCESS" });
@@ -532,7 +533,7 @@ async function runBulkScrapers() {
         records.push(record);
       }
     });
-    for (const r of records) await insertSafetyNotice("SCHEER", { ...r, deviceName: r.title });
+    await insertSafetyNoticesBatch("SCHEER", records.map(r => ({ ...r, deviceName: r.title })));
     bulkData.scheer = records;
     log("BULK", `<<< SCHEER: ${records.length} -> Snowflake`);
     results.push({ name: "SCHEER", status: "SUCCESS" });
@@ -563,7 +564,7 @@ async function runBulkScrapers() {
       if (pageCount === 0) break;
       await sleep(1000, 500);
     }
-    for (const r of records) await insertSafetyNotice("BFARM", { ...r, updateDate: r.recallDate, url: r.sourceUrl });
+    await insertSafetyNoticesBatch("BFARM", records.map(r => ({ ...r, updateDate: r.recallDate, url: r.sourceUrl })));
     bulkData.bfarm = records;
     log("BULK", `<<< BfArM: ${records.length} -> Snowflake`);
     results.push({ name: "BfArM", status: "SUCCESS" });
@@ -594,7 +595,7 @@ async function runBulkScrapers() {
       } catch (err) { if (err.message.includes("404")) break; throw err; }
       await sleep(1000, 500);
     }
-    for (const r of records) await insertSafetyNotice("AEMPS", { ...r, updateDate: r.recallDate, url: r.sourceUrl });
+    await insertSafetyNoticesBatch("AEMPS", records.map(r => ({ ...r, updateDate: r.recallDate, url: r.sourceUrl })));
     bulkData.aemps = records;
     log("BULK", `<<< AEMPS: ${records.length} -> Snowflake`);
     results.push({ name: "AEMPS", status: "SUCCESS" });
@@ -627,7 +628,7 @@ async function runBulkScrapers() {
       if (pageCount === 0) break;
       await sleep(1000, 500);
     }
-    for (const r of records) await insertSafetyNotice("IGJ", { ...r, updateDate: r.recallDate, url: r.sourceUrl });
+    await insertSafetyNoticesBatch("IGJ", records.map(r => ({ ...r, updateDate: r.recallDate, url: r.sourceUrl })));
     bulkData.igj = records;
     log("BULK", `<<< IGJ: ${records.length} -> Snowflake`);
     results.push({ name: "IGJ", status: "SUCCESS" });
@@ -656,7 +657,7 @@ async function runBulkScrapers() {
       if (pageCount === 0) break;
       await sleep(1000, 500);
     }
-    for (const r of records) await insertSafetyNotice("ISS", { ...r, updateDate: r.recallDate, url: r.sourceUrl });
+    await insertSafetyNoticesBatch("ISS", records.map(r => ({ ...r, updateDate: r.recallDate, url: r.sourceUrl })));
     bulkData.iss = records;
     log("BULK", `<<< ISS: ${records.length} -> Snowflake`);
     results.push({ name: "ISS", status: "SUCCESS" });
@@ -681,7 +682,7 @@ async function runBulkScrapers() {
       if (!nextPageToken) break;
       await sleep(400, 300);
     }
-    for (const r of records) await insertClinicalTrial(r);
+    await insertClinicalTrialsBatch(records);
     bulkData.clinicalTrials = records;
     log("BULK", `<<< ClinicalTrials.gov: ${records.length} -> Snowflake`);
     results.push({ name: "ClinicalTrials.gov", status: "SUCCESS" });
@@ -702,7 +703,7 @@ async function runBulkScrapers() {
       } catch (err) { log("BULK", `  Europe PMC "${term}" FAILED: ${err.message}`); }
       await sleep(500, 300);
     }
-    for (const r of records) await insertEuropePmc(r);
+    await insertEuropePmcBatch(records);
     bulkData.europePmc = records;
     log("BULK", `<<< Europe PMC: ${records.length} -> Snowflake`);
     results.push({ name: "Europe PMC", status: "SUCCESS" });
@@ -753,15 +754,13 @@ async function runBulkScrapers() {
       } catch { return null; }
     };
 
-    let totalAlerts = 0, totalManufacturers = 0;
+    const allMfrs = [];
+    const allAlerts = [];
     for (const brand of BRANDS) {
       // 1. Fetch EUDAMED manufacturers for this brand
       const eosData = await fetchJSON(`https://ec.europa.eu/tools/eudamed/api/eos?page=0&pageSize=20&languageIso2Code=en&name=${encodeURIComponent(brand)}`, { headers: { Accept: "application/json" } }).catch(() => null);
       const manufacturers = (eosData?.content || []).filter(a => a.actorType?.code === "refdata.actor-type.manufacturer");
-      for (const m of manufacturers) {
-        await insertEUManufacturer({ ...m, brand });
-        totalManufacturers++;
-      }
+      for (const m of manufacturers) allMfrs.push({ ...m, brand });
       const primaryMfg = manufacturers[0] || null;
 
       // 2. Fetch MHRA alerts for this brand
@@ -777,7 +776,7 @@ async function runBulkScrapers() {
       for (const a of rawAlerts.slice(0, 5)) {
         const detail = await fetchMHRADetail(a.link);
         const combined = `${a.title || ""} ${a.description || ""} ${detail || ""}`;
-        await insertMHRAAlert({
+        allAlerts.push({
           alertId: a.link,
           brand,
           manufacturerSrn: primaryMfg?.srn || null,
@@ -794,14 +793,16 @@ async function runBulkScrapers() {
           mentionsRecall: /(recall|withdraw)/i.test(combined),
           mentionsSoftware: /software/i.test(combined),
         });
-        totalAlerts++;
         await sleep(400, 200);
       }
       log("BULK", `  ${brand}: ${manufacturers.length} EU mfg records, ${rawAlerts.slice(0, 5).length} MHRA alerts`);
       await sleep(500, 300);
     }
 
-    log("BULK", `<<< MHRA + EU Manufacturers: ${totalAlerts} alerts, ${totalManufacturers} manufacturers -> Snowflake`);
+    await insertEUManufacturersBatch(allMfrs);
+    await insertMHRAAlertsBatch(allAlerts);
+
+    log("BULK", `<<< MHRA + EU Manufacturers: ${allAlerts.length} alerts, ${allMfrs.length} manufacturers -> Snowflake`);
     results.push({ name: "MHRA + EU Manufacturers", status: "SUCCESS" });
   } catch (e) { log("BULK", `<<< MHRA + EU Manufacturers FAILED: ${e.message}`); results.push({ name: "MHRA + EU Manufacturers", status: "FAILED", error: e.message }); }
 

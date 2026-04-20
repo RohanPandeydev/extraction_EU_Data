@@ -55,9 +55,62 @@ function executeSQL(sql, binds = []) {
   });
 }
 
+let dbContextSet = false;
 async function useDB() {
+  if (dbContextSet) return;
   await executeSQL(`USE DATABASE ${DB_NAME}`);
   await executeSQL("USE SCHEMA MEDICAL_DEVICES");
+  dbContextSet = true;
+}
+
+// Generic batched MERGE: dedupes by keyCols (keep last), chunks, runs 1 MERGE per chunk.
+// - table: target table name
+// - keyCols: array of column names used in ON clause and for dedupe
+// - allCols: array of all column names in source (order defines bind order)
+// - updateCols: subset of allCols to set on MATCH (exclude keys)
+// - extraUpdateSet: optional raw SQL appended to UPDATE SET (e.g. "UPDATED_AT = CURRENT_TIMESTAMP()")
+// - rows: array of objects, keyed by column names (values can be scalars, Dates, or objects — objects are JSON.stringified)
+async function bulkMerge({ table, keyCols, allCols, updateCols, extraUpdateSet = "", rows }) {
+  if (!rows || rows.length === 0) return;
+
+  // Dedupe by composite key (last occurrence wins)
+  const seen = new Map();
+  for (const row of rows) {
+    if (!row) continue;
+    const key = keyCols.map(k => (row[k] == null ? "" : String(row[k]))).join("\u0001");
+    seen.set(key, row);
+  }
+  const deduped = [...seen.values()];
+  if (deduped.length === 0) return;
+
+  await useDB();
+
+  // Snowflake bind limit is ~16k per statement; keep comfortable margin
+  const MAX_BINDS = 15000;
+  const chunkSize = Math.max(1, Math.min(200, Math.floor(MAX_BINDS / allCols.length)));
+
+  const placeholder = `(${allCols.map(() => "?").join(",")})`;
+  const colList = allCols.join(", ");
+  const onClause = keyCols.map(k => `t.${k} = s.${k}`).join(" AND ");
+  const updateSet = [
+    ...updateCols.map(c => `${c} = s.${c}`),
+    ...(extraUpdateSet ? [extraUpdateSet] : []),
+  ].join(", ");
+  const insertVals = allCols.map(c => `s.${c}`).join(", ");
+
+  for (let i = 0; i < deduped.length; i += chunkSize) {
+    const chunk = deduped.slice(i, i + chunkSize);
+    const values = chunk.map(() => placeholder).join(", ");
+    const sql = `
+      MERGE INTO ${table} AS t
+      USING (SELECT * FROM (VALUES ${values}) AS v(${colList})) AS s
+      ON ${onClause}
+      WHEN MATCHED THEN UPDATE SET ${updateSet}
+      WHEN NOT MATCHED THEN INSERT (${colList}) VALUES (${insertVals})
+    `;
+    const binds = chunk.flatMap(r => allCols.map(c => r[c] === undefined ? null : r[c]));
+    await executeSQL(sql, binds);
+  }
 }
 
 async function setupDatabase() {
@@ -382,426 +435,564 @@ async function setupDatabase() {
       CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
     )
   `);
+  // Clustering keys — critical for MERGE performance.
+  // Without these, each single-key MERGE scans the full table (~5s/query on DEVICES).
+  // With clustering, Snowflake prunes to the relevant micro-partitions (~50ms/query).
+  const clusterKeys = [
+    ["DEVICES", "UUID"],
+    ["DEVICE_ADVERSE_EVENTS", "DEVICE_UUID"],
+    ["DEVICE_CLINICAL_EVIDENCE", "DEVICE_UUID"],
+    ["DEVICE_CERTIFICATES", "DEVICE_UUID"],
+    ["MANUFACTURERS", "UUID"],
+    ["AUTHORISED_REPRESENTATIVES", "DEVICE_UUID"],
+    ["SAFETY_NOTICES", "SOURCE_ID"],
+    ["NOTIFIED_BODIES", "UUID"],
+    ["REFUSED_APPLICATIONS", "UUID"],
+    ["MHRA_ALERTS", "ALERT_ID"],
+    ["EU_MANUFACTURERS", "SRN"],
+    ["CLINICAL_TRIALS", "NCT_ID"],
+    ["EUROPE_PMC_ARTICLES", "COALESCE(PMID, PMCID)"],
+  ];
+  for (const [table, key] of clusterKeys) {
+    await executeSQL(`ALTER TABLE ${table} CLUSTER BY (${key})`).catch(() => {});
+  }
+
   console.log("Snowflake database setup complete — all tables created");
 }
 
 // === INSERT FUNCTIONS ===
 
-async function insertDeviceComplete(deviceJSON) {
+// Column definitions for batched merges
+const DEVICES_COLS = [
+  "UUID","ULID","BASIC_UDI","PRIMARY_DI","REFERENCE",
+  "TRADE_NAME","DEVICE_NAME","DEVICE_MODEL","DEVICE_CRITERION",
+  "RISK_CLASS","RISK_CLASS_CODE","LEGISLATION","LEGISLATION_CODE","LEGACY_DIRECTIVE",
+  "SPECIAL_DEVICE_TYPE","ISSUING_AGENCY","CONTAINER_PACKAGE_COUNT",
+  "IS_ACTIVE","IS_IMPLANTABLE","IS_REUSABLE","IS_STERILE",
+  "HAS_MEASURING_FUNCTION","ADMINISTERS_MEDICINE","IS_MULTI_COMPONENT",
+  "CONTAINS_HUMAN_TISSUES","CONTAINS_ANIMAL_TISSUES","CONTAINS_HUMAN_PRODUCT","CONTAINS_MEDICINAL_PRODUCT",
+  "IS_KIT","IS_REAGENT","IS_INSTRUMENT","IS_COMPANION_DIAGNOSTIC",
+  "IS_SELF_TESTING","IS_NEAR_PATIENT_TESTING","IS_PROFESSIONAL_TESTING",
+  "DEVICE_STATUS","VERSION_STATE","LATEST_VERSION","VERSION_NUMBER",
+  "VERSION_DATE","LAST_UPDATE_DATE","DISCARDED_DATE","IS_NEW",
+  "CLINICAL_INVESTIGATION_APPLICABLE","RAW_DATA",
+];
+
+function deviceRow(deviceJSON) {
   const uuid = deviceJSON.identity?.uuid;
-  if (!uuid) return;
-  await useDB();
+  if (!uuid) return null;
+  return {
+    UUID: uuid,
+    ULID: deviceJSON.identity?.ulid,
+    BASIC_UDI: deviceJSON.identity?.basicUdi,
+    PRIMARY_DI: deviceJSON.identity?.primaryDi,
+    REFERENCE: deviceJSON.identity?.reference,
+    TRADE_NAME: deviceJSON.identity?.tradeName,
+    DEVICE_NAME: deviceJSON.identity?.deviceName,
+    DEVICE_MODEL: deviceJSON.identity?.deviceModel,
+    DEVICE_CRITERION: deviceJSON.identity?.deviceCriterion,
+    RISK_CLASS: deviceJSON.classification?.riskClass,
+    RISK_CLASS_CODE: deviceJSON.classification?.riskClassCode,
+    LEGISLATION: deviceJSON.classification?.legislation,
+    LEGISLATION_CODE: deviceJSON.classification?.legislationCode,
+    LEGACY_DIRECTIVE: deviceJSON.classification?.legacyDirective || false,
+    SPECIAL_DEVICE_TYPE: deviceJSON.classification?.specialDeviceType,
+    ISSUING_AGENCY: deviceJSON.classification?.issuingAgency,
+    CONTAINER_PACKAGE_COUNT: deviceJSON.classification?.containerPackageCount || 0,
+    IS_ACTIVE: deviceJSON.characteristics?.active || false,
+    IS_IMPLANTABLE: deviceJSON.characteristics?.implantable || false,
+    IS_REUSABLE: deviceJSON.characteristics?.reusable || false,
+    IS_STERILE: deviceJSON.characteristics?.sterile || false,
+    HAS_MEASURING_FUNCTION: deviceJSON.characteristics?.measuringFunction || false,
+    ADMINISTERS_MEDICINE: deviceJSON.characteristics?.administeringMedicine || false,
+    IS_MULTI_COMPONENT: Boolean(deviceJSON.characteristics?.multiComponent && typeof deviceJSON.characteristics?.multiComponent !== "object"),
+    CONTAINS_HUMAN_TISSUES: deviceJSON.characteristics?.humanTissues || false,
+    CONTAINS_ANIMAL_TISSUES: deviceJSON.characteristics?.animalTissues || false,
+    CONTAINS_HUMAN_PRODUCT: deviceJSON.characteristics?.humanProduct || false,
+    CONTAINS_MEDICINAL_PRODUCT: deviceJSON.characteristics?.medicinalProduct || false,
+    IS_KIT: deviceJSON.characteristics?.kit || false,
+    IS_REAGENT: deviceJSON.characteristics?.reagent || false,
+    IS_INSTRUMENT: deviceJSON.characteristics?.instrument || false,
+    IS_COMPANION_DIAGNOSTIC: deviceJSON.characteristics?.companionDiagnostics || false,
+    IS_SELF_TESTING: deviceJSON.characteristics?.selfTesting || false,
+    IS_NEAR_PATIENT_TESTING: deviceJSON.characteristics?.nearPatientTesting || false,
+    IS_PROFESSIONAL_TESTING: deviceJSON.characteristics?.professionalTesting || false,
+    DEVICE_STATUS: deviceJSON.status?.deviceStatus,
+    VERSION_STATE: deviceJSON.status?.versionState,
+    LATEST_VERSION: deviceJSON.status?.latestVersion,
+    VERSION_NUMBER: deviceJSON.status?.versionNumber,
+    VERSION_DATE: deviceJSON.status?.versionDate,
+    LAST_UPDATE_DATE: deviceJSON.status?.lastUpdateDate,
+    DISCARDED_DATE: deviceJSON.status?.discardedDate,
+    IS_NEW: deviceJSON.status?.isNew || false,
+    CLINICAL_INVESTIGATION_APPLICABLE: deviceJSON.clinicalInvestigation?.applicable || false,
+    RAW_DATA: JSON.stringify(deviceJSON),
+  };
+}
 
-  // 1. DEVICES table
-  // Simple INSERT with ON CONFLICT-style handling via MERGE
-  await executeSQL(
-    `
-    MERGE INTO DEVICES AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
-    WHEN MATCHED THEN UPDATE SET
-      TRADE_NAME=?, DEVICE_NAME=?, DEVICE_MODEL=?, RISK_CLASS=?, LEGISLATION=?,
-      DEVICE_STATUS=?, LAST_UPDATE_DATE=?, RAW_DATA=?, UPDATED_AT=CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN INSERT (
-      UUID, ULID, BASIC_UDI, PRIMARY_DI, REFERENCE,
-      TRADE_NAME, DEVICE_NAME, DEVICE_MODEL, DEVICE_CRITERION,
-      RISK_CLASS, RISK_CLASS_CODE, LEGISLATION, LEGISLATION_CODE, LEGACY_DIRECTIVE,
-      SPECIAL_DEVICE_TYPE, ISSUING_AGENCY, CONTAINER_PACKAGE_COUNT,
-      IS_ACTIVE, IS_IMPLANTABLE, IS_REUSABLE, IS_STERILE,
-      HAS_MEASURING_FUNCTION, ADMINISTERS_MEDICINE, IS_MULTI_COMPONENT,
-      CONTAINS_HUMAN_TISSUES, CONTAINS_ANIMAL_TISSUES, CONTAINS_HUMAN_PRODUCT, CONTAINS_MEDICINAL_PRODUCT,
-      IS_KIT, IS_REAGENT, IS_INSTRUMENT, IS_COMPANION_DIAGNOSTIC,
-      IS_SELF_TESTING, IS_NEAR_PATIENT_TESTING, IS_PROFESSIONAL_TESTING,
-      DEVICE_STATUS, VERSION_STATE, LATEST_VERSION, VERSION_NUMBER,
-      VERSION_DATE, LAST_UPDATE_DATE, DISCARDED_DATE, IS_NEW,
-      CLINICAL_INVESTIGATION_APPLICABLE, RAW_DATA
-    ) VALUES (
-      ?,?,?,?,?,
-      ?,?,?,?,
-      ?,?,?,?,?,
-      ?,?,?,
-      ?,?,?,?,
-      ?,?,?,
-      ?,?,?,?,
-      ?,?,?,?,
-      ?,?,?,
-      ?,?,?,?,
-      ?,?,?,?,
-      ?,?
-    )
-  `,
-    [
-      uuid,
-      // UPDATE binds (8)
-      deviceJSON.identity?.tradeName,
-      deviceJSON.identity?.deviceName,
-      deviceJSON.identity?.deviceModel,
-      deviceJSON.classification?.riskClass,
-      deviceJSON.classification?.legislation,
-      deviceJSON.status?.deviceStatus,
-      deviceJSON.status?.lastUpdateDate,
-      JSON.stringify(deviceJSON),
-      // INSERT binds (45)
-      uuid,
-      deviceJSON.identity?.ulid,
-      deviceJSON.identity?.basicUdi,
-      deviceJSON.identity?.primaryDi,
-      deviceJSON.identity?.reference,
-      deviceJSON.identity?.tradeName,
-      deviceJSON.identity?.deviceName,
-      deviceJSON.identity?.deviceModel,
-      deviceJSON.identity?.deviceCriterion,
-      deviceJSON.classification?.riskClass,
-      deviceJSON.classification?.riskClassCode,
-      deviceJSON.classification?.legislation,
-      deviceJSON.classification?.legislationCode,
-      deviceJSON.classification?.legacyDirective || false,
-      deviceJSON.classification?.specialDeviceType,
-      deviceJSON.classification?.issuingAgency,
-      deviceJSON.classification?.containerPackageCount || 0,
-      deviceJSON.characteristics?.active || false,
-      deviceJSON.characteristics?.implantable || false,
-      deviceJSON.characteristics?.reusable || false,
-      deviceJSON.characteristics?.sterile || false,
-      deviceJSON.characteristics?.measuringFunction || false,
-      deviceJSON.characteristics?.administeringMedicine || false,
-      Boolean(deviceJSON.characteristics?.multiComponent && typeof deviceJSON.characteristics?.multiComponent !== 'object'),
-      deviceJSON.characteristics?.humanTissues || false,
-      deviceJSON.characteristics?.animalTissues || false,
-      deviceJSON.characteristics?.humanProduct || false,
-      deviceJSON.characteristics?.medicinalProduct || false,
-      deviceJSON.characteristics?.kit || false,
-      deviceJSON.characteristics?.reagent || false,
-      deviceJSON.characteristics?.instrument || false,
-      deviceJSON.characteristics?.companionDiagnostics || false,
-      deviceJSON.characteristics?.selfTesting || false,
-      deviceJSON.characteristics?.nearPatientTesting || false,
-      deviceJSON.characteristics?.professionalTesting || false,
-      deviceJSON.status?.deviceStatus,
-      deviceJSON.status?.versionState,
-      deviceJSON.status?.latestVersion,
-      deviceJSON.status?.versionNumber,
-      deviceJSON.status?.versionDate,
-      deviceJSON.status?.lastUpdateDate,
-      deviceJSON.status?.discardedDate,
-      deviceJSON.status?.isNew || false,
-      deviceJSON.clinicalInvestigation?.applicable || false,
-      JSON.stringify(deviceJSON),
-    ],
-  );
-
-  // 2. MANUFACTURERS table — use uuid if available, otherwise fall back to srn or name
-  const mfr = deviceJSON.manufacturer;
-  if (mfr && (mfr.uuid || mfr.srn || mfr.name)) {
+function manufacturerRows(deviceJSONs) {
+  const out = [];
+  for (const d of deviceJSONs) {
+    const mfr = d.manufacturer;
+    if (!mfr || !(mfr.uuid || mfr.srn || mfr.name)) continue;
     const mfrKey = mfr.uuid || mfr.srn || `name:${mfr.name}`;
-    await executeSQL(
-      `
-      MERGE INTO MANUFACTURERS AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
-      WHEN MATCHED THEN UPDATE SET
-        SRN=?, NAME=?, STATUS=?, COUNTRY_ISO2=?, COUNTRY_NAME=?, COUNTRY_TYPE=?, ADDRESS=?, EMAIL=?, PHONE=?
-      WHEN NOT MATCHED THEN INSERT (UUID, SRN, NAME, STATUS, COUNTRY_ISO2, COUNTRY_NAME, COUNTRY_TYPE, ADDRESS, EMAIL, PHONE)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
-    `,
-      [
-        mfrKey,
-        // UPDATE binds (9)
-        mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
-        // INSERT binds (10)
-        mfrKey, mfr.srn, mfr.name, mfr.status, mfr.countryIso2Code, mfr.countryName, mfr.countryType, mfr.address, mfr.email, mfr.phone,
-      ],
-    );
+    out.push({
+      UUID: mfrKey, SRN: mfr.srn, NAME: mfr.name, STATUS: mfr.status,
+      COUNTRY_ISO2: mfr.countryIso2Code, COUNTRY_NAME: mfr.countryName, COUNTRY_TYPE: mfr.countryType,
+      ADDRESS: mfr.address, EMAIL: mfr.email, PHONE: mfr.phone,
+    });
   }
-
-  // 3. AUTHORISED REPRESENTATIVES
-  const ar = deviceJSON.authorisedRepresentative;
-  if (ar?.name) {
-    await executeSQL(
-      `
-      MERGE INTO AUTHORISED_REPRESENTATIVES AS t USING (SELECT ? AS DEVICE_UUID) AS s ON t.DEVICE_UUID = s.DEVICE_UUID
-      WHEN MATCHED THEN UPDATE SET
-        NAME=?, SRN=?, ADDRESS=?, COUNTRY_NAME=?, EMAIL=?, PHONE=?, MANDATE_START_DATE=?, MANDATE_END_DATE=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, NAME, SRN, ADDRESS, COUNTRY_NAME, EMAIL, PHONE, MANDATE_START_DATE, MANDATE_END_DATE)
-      VALUES (?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid,
-        // UPDATE binds (8)
-        ar.name, ar.srn, ar.address, ar.countryName, ar.email, ar.phone, ar.mandateStartDate, ar.mandateEndDate,
-        // INSERT binds (9)
-        uuid, ar.name, ar.srn, ar.address, ar.countryName, ar.email, ar.phone, ar.mandateStartDate, ar.mandateEndDate,
-      ],
-    );
-  }
-
-  // 4. CERTIFICATES
-  for (const cert of deviceJSON.certificates || []) {
-    await executeSQL(
-      `
-      MERGE INTO DEVICE_CERTIFICATES AS t
-      USING (SELECT ? AS DEVICE_UUID, ? AS CERTIFICATE_UUID) AS s
-      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.CERTIFICATE_UUID = s.CERTIFICATE_UUID
-      WHEN MATCHED THEN UPDATE SET
-        CERTIFICATE_NUMBER=?, CERTIFICATE_TYPE=?, ISSUE_DATE=?, EXPIRY_DATE=?, STARTING_VALIDITY_DATE=?, STATUS=?, NOTIFIED_BODY_NAME=?, NOTIFIED_BODY_SRN=?, NOTIFIED_BODY_COUNTRY=?, REVISION=?, SOURCE=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, CERTIFICATE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STARTING_VALIDITY_DATE, STATUS, NOTIFIED_BODY_NAME, NOTIFIED_BODY_SRN, NOTIFIED_BODY_COUNTRY, REVISION, SOURCE)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid, cert.uuid,
-        // UPDATE binds (11)
-        cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.startingValidityDate, cert.status, cert.notifiedBody?.name, cert.notifiedBody?.srn, cert.notifiedBody?.countryIso2Code, cert.revision, "EUDAMED",
-        // INSERT binds (13)
-        uuid, cert.uuid, cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.startingValidityDate, cert.status, cert.notifiedBody?.name, cert.notifiedBody?.srn, cert.notifiedBody?.countryIso2Code, cert.revision, "EUDAMED",
-      ],
-    );
-  }
-  for (const cert of deviceJSON.manufacturerCertificates || []) {
-    await executeSQL(
-      `
-      MERGE INTO DEVICE_CERTIFICATES AS t
-      USING (SELECT ? AS DEVICE_UUID, ? AS CERTIFICATE_NUMBER, ? AS SOURCE) AS s
-      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.CERTIFICATE_NUMBER = s.CERTIFICATE_NUMBER AND t.SOURCE = s.SOURCE
-      WHEN MATCHED THEN UPDATE SET
-        CERTIFICATE_TYPE=?, ISSUE_DATE=?, EXPIRY_DATE=?, STATUS=?, NOTIFIED_BODY_SRN=?, REVISION=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, CERTIFICATE_NUMBER, CERTIFICATE_TYPE, ISSUE_DATE, EXPIRY_DATE, STATUS, NOTIFIED_BODY_SRN, REVISION, SOURCE)
-      VALUES (?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid, cert.certificateNumber, "EUDAMED_MFR",
-        // UPDATE binds (6)
-        cert.certificateType, cert.issueDate, cert.expiryDate, cert.status, cert.notifiedBodySrn, cert.revision,
-        // INSERT binds (9)
-        uuid, cert.certificateNumber, cert.certificateType, cert.issueDate, cert.expiryDate, cert.status, cert.notifiedBodySrn, cert.revision, "EUDAMED_MFR",
-      ],
-    );
-  }
-
-  // 5. ADVERSE EVENTS (deduplicate by DEVICE_UUID + TITLE)
-  const deviceName =
-    deviceJSON.identity?.tradeName || deviceJSON.identity?.deviceName;
-  for (const ae of deviceJSON.adverseEvents || []) {
-    await executeSQL(
-      `
-      MERGE INTO DEVICE_ADVERSE_EVENTS AS t
-      USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
-      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
-      WHEN MATCHED THEN UPDATE SET
-        DEVICE_NAME=?, SOURCE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?, STATUS=?, EVENT_DATE=?,
-        MATCH_CONFIDENCE=?, MATCH_TYPE=?, MATCHED_KEYWORD=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, STATUS, EVENT_DATE, MATCH_CONFIDENCE, MATCH_TYPE, MATCHED_KEYWORD)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid, ae.title,
-        // UPDATE binds (12)
-        deviceName, ae.source, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
-        ae.matchConfidence ?? null, ae.matchType ?? null, ae.matchedKeyword ?? null,
-        // INSERT binds (14)
-        uuid, deviceName, ae.source, ae.title, ae.authors, ae.journal, ae.publicationDate || ae.date, ae.doi, ae.url, ae.status || ae.type || ae.source, ae.date || ae.publicationDate,
-        ae.matchConfidence ?? null, ae.matchType ?? null, ae.matchedKeyword ?? null,
-      ],
-    );
-  }
-
-  // 6. CLINICAL EVIDENCE (deduplicate by DEVICE_UUID + TITLE)
-  for (const ce of deviceJSON.clinicalEvidence || []) {
-    await executeSQL(
-      `
-      MERGE INTO DEVICE_CLINICAL_EVIDENCE AS t
-      USING (SELECT ? AS DEVICE_UUID, ? AS TITLE) AS s
-      ON t.DEVICE_UUID = s.DEVICE_UUID AND t.TITLE = s.TITLE
-      WHEN MATCHED THEN UPDATE SET
-        DEVICE_NAME=?, SOURCE=?, EVIDENCE_TYPE=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, DOI=?, URL=?,
-        MATCH_CONFIDENCE=?, MATCH_TYPE=?, MATCHED_KEYWORD=?
-      WHEN NOT MATCHED THEN INSERT (DEVICE_UUID, DEVICE_NAME, SOURCE, EVIDENCE_TYPE, TITLE, AUTHORS, JOURNAL, PUBLICATION_DATE, DOI, URL, MATCH_CONFIDENCE, MATCH_TYPE, MATCHED_KEYWORD)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `,
-      [
-        uuid, ce.title,
-        // UPDATE binds (11)
-        deviceName, ce.source, ce.type, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
-        ce.matchConfidence ?? null, ce.matchType ?? null, ce.matchedKeyword ?? null,
-        // INSERT binds (13)
-        uuid, deviceName, ce.source, ce.type, ce.title, ce.authors, ce.journal, ce.publicationDate, ce.doi, ce.url,
-        ce.matchConfidence ?? null, ce.matchType ?? null, ce.matchedKeyword ?? null,
-      ],
-    );
-  }
-
+  return out;
 }
 
-async function insertNotifiedBody(nb) {
+function arRows(deviceJSONs) {
+  const out = [];
+  for (const d of deviceJSONs) {
+    const ar = d.authorisedRepresentative;
+    const uuid = d.identity?.uuid;
+    if (!ar?.name || !uuid) continue;
+    out.push({
+      DEVICE_UUID: uuid, NAME: ar.name, SRN: ar.srn, ADDRESS: ar.address,
+      COUNTRY_NAME: ar.countryName, EMAIL: ar.email, PHONE: ar.phone,
+      MANDATE_START_DATE: ar.mandateStartDate, MANDATE_END_DATE: ar.mandateEndDate,
+    });
+  }
+  return out;
+}
+
+function certRows(deviceJSONs) {
+  const primary = [];
+  const mfrCerts = [];
+  for (const d of deviceJSONs) {
+    const uuid = d.identity?.uuid;
+    if (!uuid) continue;
+    for (const cert of d.certificates || []) {
+      primary.push({
+        DEVICE_UUID: uuid, CERTIFICATE_UUID: cert.uuid,
+        CERTIFICATE_NUMBER: cert.certificateNumber, CERTIFICATE_TYPE: cert.certificateType,
+        ISSUE_DATE: cert.issueDate, EXPIRY_DATE: cert.expiryDate,
+        STARTING_VALIDITY_DATE: cert.startingValidityDate, STATUS: cert.status,
+        NOTIFIED_BODY_NAME: cert.notifiedBody?.name, NOTIFIED_BODY_SRN: cert.notifiedBody?.srn,
+        NOTIFIED_BODY_COUNTRY: cert.notifiedBody?.countryIso2Code, REVISION: cert.revision,
+        SOURCE: "EUDAMED",
+      });
+    }
+    for (const cert of d.manufacturerCertificates || []) {
+      mfrCerts.push({
+        DEVICE_UUID: uuid, CERTIFICATE_NUMBER: cert.certificateNumber,
+        CERTIFICATE_TYPE: cert.certificateType, ISSUE_DATE: cert.issueDate,
+        EXPIRY_DATE: cert.expiryDate, STATUS: cert.status,
+        NOTIFIED_BODY_SRN: cert.notifiedBodySrn, REVISION: cert.revision,
+        SOURCE: "EUDAMED_MFR",
+      });
+    }
+  }
+  return { primary, mfrCerts };
+}
+
+function adverseRows(deviceJSONs) {
+  const out = [];
+  for (const d of deviceJSONs) {
+    const uuid = d.identity?.uuid;
+    if (!uuid) continue;
+    const deviceName = d.identity?.tradeName || d.identity?.deviceName;
+    for (const ae of d.adverseEvents || []) {
+      if (!ae?.title) continue;
+      out.push({
+        DEVICE_UUID: uuid, DEVICE_NAME: deviceName, SOURCE: ae.source, TITLE: ae.title,
+        AUTHORS: ae.authors, JOURNAL: ae.journal,
+        PUBLICATION_DATE: ae.publicationDate || ae.date, DOI: ae.doi, URL: ae.url,
+        STATUS: ae.status || ae.type || ae.source,
+        EVENT_DATE: ae.date || ae.publicationDate,
+        MATCH_CONFIDENCE: ae.matchConfidence ?? null,
+        MATCH_TYPE: ae.matchType ?? null,
+        MATCHED_KEYWORD: ae.matchedKeyword ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+function evidenceRows(deviceJSONs) {
+  const out = [];
+  for (const d of deviceJSONs) {
+    const uuid = d.identity?.uuid;
+    if (!uuid) continue;
+    const deviceName = d.identity?.tradeName || d.identity?.deviceName;
+    for (const ce of d.clinicalEvidence || []) {
+      if (!ce?.title) continue;
+      out.push({
+        DEVICE_UUID: uuid, DEVICE_NAME: deviceName, SOURCE: ce.source,
+        EVIDENCE_TYPE: ce.type, TITLE: ce.title, AUTHORS: ce.authors,
+        JOURNAL: ce.journal, PUBLICATION_DATE: ce.publicationDate,
+        DOI: ce.doi, URL: ce.url,
+        MATCH_CONFIDENCE: ce.matchConfidence ?? null,
+        MATCH_TYPE: ce.matchType ?? null,
+        MATCHED_KEYWORD: ce.matchedKeyword ?? null,
+      });
+    }
+  }
+  return out;
+}
+
+// Cache of UUID -> LAST_UPDATE_DATE already in Snowflake at start of this process.
+// Populated lazily on first insertDevicesBatch call; used to skip unchanged devices
+// (huge cost saver when the same EUDAMED data is re-loaded on every CI run).
+let existingDeviceDates = null;
+async function loadExistingDeviceDates() {
+  if (existingDeviceDates) return existingDeviceDates;
   await useDB();
-  const mdrStatus =
-    nb.legislationStatusMap?.["refdata.applicable-legislation.mdr"]?.code
-      ?.split(".")
-      .pop() || null;
-  const ivdrStatus =
-    nb.legislationStatusMap?.["refdata.applicable-legislation.ivdr"]?.code
-      ?.split(".")
-      .pop() || null;
-  await executeSQL(
-    `
-    MERGE INTO NOTIFIED_BODIES AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
-    WHEN MATCHED THEN UPDATE SET
-      NAME=?, IDENTIFIER=?, MDR_STATUS=?, IVDR_STATUS=?, RAW_DATA=?
-    WHEN NOT MATCHED THEN INSERT (UUID, NAME, IDENTIFIER, MDR_STATUS, IVDR_STATUS, RAW_DATA)
-    VALUES (?,?,?,?,?,?)
-    `,
-    [
-      nb.uuid,
-      // UPDATE binds (5)
-      nb.name, nb.eudamedIdentifier, mdrStatus, ivdrStatus, JSON.stringify(nb),
-      // INSERT binds (6)
-      nb.uuid, nb.name, nb.eudamedIdentifier, mdrStatus, ivdrStatus, JSON.stringify(nb),
-    ],
-  );
+  existingDeviceDates = new Map();
+  try {
+    const rows = await executeSQL("SELECT UUID, LAST_UPDATE_DATE FROM DEVICES");
+    for (const r of rows || []) existingDeviceDates.set(r.UUID, r.LAST_UPDATE_DATE);
+  } catch (e) {
+    // Table may not exist yet on first-ever run — treat as empty
+    console.log(`[snowflake] skip-cache init: ${e.message}`);
+  }
+  return existingDeviceDates;
+}
+// Force-refresh or bypass (for scripts that need to write regardless of freshness)
+function resetDeviceDateCache() { existingDeviceDates = null; }
+
+async function insertDevicesBatch(deviceJSONs) {
+  if (!deviceJSONs || deviceJSONs.length === 0) return;
+
+  // Skip devices whose LAST_UPDATE_DATE already matches Snowflake.
+  // Children are derived from the device JSON — if the device didn't change, its children didn't either.
+  const cache = await loadExistingDeviceDates();
+  const changed = deviceJSONs.filter(d => {
+    const uuid = d?.identity?.uuid;
+    if (!uuid) return false;
+    const incoming = d.status?.lastUpdateDate || null;
+    const existing = cache.get(uuid);
+    if (existing !== undefined && existing === incoming) return false; // unchanged
+    // Record the new date so a later duplicate within this run also skips
+    cache.set(uuid, incoming);
+    return true;
+  });
+  if (changed.length === 0) return;
+
+  const deviceRows = changed.map(deviceRow).filter(Boolean);
+  await bulkMerge({
+    table: "DEVICES",
+    keyCols: ["UUID"],
+    allCols: DEVICES_COLS,
+    updateCols: DEVICES_COLS.filter(c => c !== "UUID"),
+    extraUpdateSet: "UPDATED_AT = CURRENT_TIMESTAMP()",
+    rows: deviceRows,
+  });
+
+  await bulkMerge({
+    table: "MANUFACTURERS",
+    keyCols: ["UUID"],
+    allCols: ["UUID","SRN","NAME","STATUS","COUNTRY_ISO2","COUNTRY_NAME","COUNTRY_TYPE","ADDRESS","EMAIL","PHONE"],
+    updateCols: ["SRN","NAME","STATUS","COUNTRY_ISO2","COUNTRY_NAME","COUNTRY_TYPE","ADDRESS","EMAIL","PHONE"],
+    rows: manufacturerRows(changed),
+  });
+
+  await bulkMerge({
+    table: "AUTHORISED_REPRESENTATIVES",
+    keyCols: ["DEVICE_UUID"],
+    allCols: ["DEVICE_UUID","NAME","SRN","ADDRESS","COUNTRY_NAME","EMAIL","PHONE","MANDATE_START_DATE","MANDATE_END_DATE"],
+    updateCols: ["NAME","SRN","ADDRESS","COUNTRY_NAME","EMAIL","PHONE","MANDATE_START_DATE","MANDATE_END_DATE"],
+    rows: arRows(changed),
+  });
+
+  const { primary, mfrCerts } = certRows(changed);
+  await bulkMerge({
+    table: "DEVICE_CERTIFICATES",
+    keyCols: ["DEVICE_UUID","CERTIFICATE_UUID"],
+    allCols: ["DEVICE_UUID","CERTIFICATE_UUID","CERTIFICATE_NUMBER","CERTIFICATE_TYPE","ISSUE_DATE","EXPIRY_DATE","STARTING_VALIDITY_DATE","STATUS","NOTIFIED_BODY_NAME","NOTIFIED_BODY_SRN","NOTIFIED_BODY_COUNTRY","REVISION","SOURCE"],
+    updateCols: ["CERTIFICATE_NUMBER","CERTIFICATE_TYPE","ISSUE_DATE","EXPIRY_DATE","STARTING_VALIDITY_DATE","STATUS","NOTIFIED_BODY_NAME","NOTIFIED_BODY_SRN","NOTIFIED_BODY_COUNTRY","REVISION","SOURCE"],
+    rows: primary,
+  });
+  await bulkMerge({
+    table: "DEVICE_CERTIFICATES",
+    keyCols: ["DEVICE_UUID","CERTIFICATE_NUMBER","SOURCE"],
+    allCols: ["DEVICE_UUID","CERTIFICATE_NUMBER","CERTIFICATE_TYPE","ISSUE_DATE","EXPIRY_DATE","STATUS","NOTIFIED_BODY_SRN","REVISION","SOURCE"],
+    updateCols: ["CERTIFICATE_TYPE","ISSUE_DATE","EXPIRY_DATE","STATUS","NOTIFIED_BODY_SRN","REVISION"],
+    rows: mfrCerts,
+  });
+
+  await bulkMerge({
+    table: "DEVICE_ADVERSE_EVENTS",
+    keyCols: ["DEVICE_UUID","TITLE"],
+    allCols: ["DEVICE_UUID","DEVICE_NAME","SOURCE","TITLE","AUTHORS","JOURNAL","PUBLICATION_DATE","DOI","URL","STATUS","EVENT_DATE","MATCH_CONFIDENCE","MATCH_TYPE","MATCHED_KEYWORD"],
+    updateCols: ["DEVICE_NAME","SOURCE","AUTHORS","JOURNAL","PUBLICATION_DATE","DOI","URL","STATUS","EVENT_DATE","MATCH_CONFIDENCE","MATCH_TYPE","MATCHED_KEYWORD"],
+    rows: adverseRows(changed),
+  });
+
+  await bulkMerge({
+    table: "DEVICE_CLINICAL_EVIDENCE",
+    keyCols: ["DEVICE_UUID","TITLE"],
+    allCols: ["DEVICE_UUID","DEVICE_NAME","SOURCE","EVIDENCE_TYPE","TITLE","AUTHORS","JOURNAL","PUBLICATION_DATE","DOI","URL","MATCH_CONFIDENCE","MATCH_TYPE","MATCHED_KEYWORD"],
+    updateCols: ["DEVICE_NAME","SOURCE","EVIDENCE_TYPE","AUTHORS","JOURNAL","PUBLICATION_DATE","DOI","URL","MATCH_CONFIDENCE","MATCH_TYPE","MATCHED_KEYWORD"],
+    rows: evidenceRows(changed),
+  });
 }
 
-async function insertRefusedApplication(app) {
+// Single-device wrapper (kept for backward compat with per-device callers)
+async function insertDeviceComplete(deviceJSON) {
+  if (!deviceJSON?.identity?.uuid) return;
+  await insertDevicesBatch([deviceJSON]);
+}
+
+// Fetch the set of existing primary keys in `table` (for skip-if-exists optimization).
+// Cached per-table for the process lifetime. Returns a Set of stringified keys.
+const existingKeysCache = new Map();
+async function loadExistingKeys(table, keyCol) {
+  const cacheId = `${table}.${keyCol}`;
+  if (existingKeysCache.has(cacheId)) return existingKeysCache.get(cacheId);
   await useDB();
-  await executeSQL(
-    `
-    MERGE INTO REFUSED_APPLICATIONS AS t USING (SELECT ? AS UUID) AS s ON t.UUID = s.UUID
-    WHEN MATCHED THEN UPDATE SET
-      ACTOR_SRN=?, ACTOR_NAME=?, NOTIFIED_BODY_SRN=?, APPLICATION_REFERENCE=?, CONFORMITY_PROCEDURE=?, DECISION=?, DECISION_DATE=?, LAST_UPDATE_DATE=?, RAW_DATA=?
-    WHEN NOT MATCHED THEN INSERT (UUID, ACTOR_SRN, ACTOR_NAME, NOTIFIED_BODY_SRN, APPLICATION_REFERENCE, CONFORMITY_PROCEDURE, DECISION, DECISION_DATE, LAST_UPDATE_DATE, RAW_DATA)
-    VALUES (?,?,?,?,?,?,?,?,?,?)
-    `,
-    [
-      app.uuid,
-      // UPDATE binds (9)
-      app.actorSrn, app.actorName, app.notifiedBodySrn, app.applicationReferenceNumber, app.conformityAssessmentProcedure?.code, app.decision?.code, app.decisionDate, app.lastUpdateDate, JSON.stringify(app),
-      // INSERT binds (10)
-      app.uuid, app.actorSrn, app.actorName, app.notifiedBodySrn, app.applicationReferenceNumber, app.conformityAssessmentProcedure?.code, app.decision?.code, app.decisionDate, app.lastUpdateDate, JSON.stringify(app),
-    ],
-  );
+  const set = new Set();
+  try {
+    const rows = await executeSQL(`SELECT ${keyCol} FROM ${table}`);
+    for (const r of rows || []) if (r[keyCol] != null) set.add(String(r[keyCol]));
+  } catch (e) {
+    console.log(`[snowflake] skip-cache init for ${table}: ${e.message}`);
+  }
+  existingKeysCache.set(cacheId, set);
+  return set;
+}
+function markKeyInserted(table, keyCol, key) {
+  const set = existingKeysCache.get(`${table}.${keyCol}`);
+  if (set && key != null) set.add(String(key));
 }
 
-async function insertSafetyNotice(source, record) {
-  await useDB();
-  const sourceId = `${source}_${(record.deviceName || record.title || "").substring(0, 200)}_${record.updateDate || record.date || ""}`;
-  await executeSQL(
-    `
-    MERGE INTO SAFETY_NOTICES AS t USING (SELECT ? AS SOURCE_ID) AS s ON t.SOURCE_ID = s.SOURCE_ID
-    WHEN MATCHED THEN UPDATE SET
-      SOURCE=?, TITLE=?, DEVICE_NAME=?, DEVICE_TYPE=?, STATUS=?, NOTICE_DATE=?, RETURN_DATE=?, TOPIC=?, URL=?, RAW_DATA=?
-    WHEN NOT MATCHED THEN INSERT (SOURCE, SOURCE_ID, TITLE, DEVICE_NAME, DEVICE_TYPE, STATUS, NOTICE_DATE, RETURN_DATE, TOPIC, URL, RAW_DATA)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    `,
-    [
-      sourceId,
-      // UPDATE binds (10)
-      source, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
-      // INSERT binds (11)
-      source, sourceId, record.title || record.deviceName, record.deviceName, record.deviceType, record.status, record.updateDate || record.date, record.returnDate, record.topic, record.url, JSON.stringify(record),
-    ],
-  );
+// === BATCH INSERT FUNCTIONS (preferred) ===
+
+async function insertNotifiedBodiesBatch(nbs) {
+  const existing = await loadExistingKeys("NOTIFIED_BODIES", "UUID");
+  const rows = (nbs || [])
+    .filter(n => n?.uuid && !existing.has(String(n.uuid)))
+    .map(nb => {
+      markKeyInserted("NOTIFIED_BODIES", "UUID", nb.uuid);
+      return {
+        UUID: nb.uuid,
+        NAME: nb.name,
+        IDENTIFIER: nb.eudamedIdentifier,
+        MDR_STATUS: nb.legislationStatusMap?.["refdata.applicable-legislation.mdr"]?.code?.split(".").pop() || null,
+        IVDR_STATUS: nb.legislationStatusMap?.["refdata.applicable-legislation.ivdr"]?.code?.split(".").pop() || null,
+        RAW_DATA: JSON.stringify(nb),
+      };
+    });
+  await bulkMerge({
+    table: "NOTIFIED_BODIES",
+    keyCols: ["UUID"],
+    allCols: ["UUID","NAME","IDENTIFIER","MDR_STATUS","IVDR_STATUS","RAW_DATA"],
+    updateCols: ["NAME","IDENTIFIER","MDR_STATUS","IVDR_STATUS","RAW_DATA"],
+    rows,
+  });
 }
 
-async function insertMHRAAlert(a) {
-  if (!a.alertId) return;
-  await executeSQL(
-    `MERGE INTO MHRA_ALERTS AS t USING (SELECT ? AS ALERT_ID) AS s ON t.ALERT_ID = s.ALERT_ID
-     WHEN MATCHED THEN UPDATE SET
-       BRAND=?, MANUFACTURER_SRN=?, MANUFACTURER_NAME=?, MANUFACTURER_COUNTRY=?,
-       TITLE=?, DESCRIPTION=?, FULL_CONTENT=?, PUBLISHED_DATE=?, ALERT_TYPE=?, URL=?,
-       PROBLEM_CATEGORIES=?, MENTIONS_PATIENT_HARM=?, MENTIONS_RECALL=?, MENTIONS_SOFTWARE=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (
-       ALERT_ID, BRAND, MANUFACTURER_SRN, MANUFACTURER_NAME, MANUFACTURER_COUNTRY,
-       TITLE, DESCRIPTION, FULL_CONTENT, PUBLISHED_DATE, ALERT_TYPE, URL,
-       PROBLEM_CATEGORIES, MENTIONS_PATIENT_HARM, MENTIONS_RECALL, MENTIONS_SOFTWARE, RAW_DATA
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      a.alertId,
-      a.brand, a.manufacturerSrn, a.manufacturerName, a.manufacturerCountry,
-      a.title, a.description, a.fullContent, a.publishedDate, a.alertType, a.url,
-      JSON.stringify(a.problemCategories || []), !!a.mentionsPatientHarm, !!a.mentionsRecall, !!a.mentionsSoftware,
-      JSON.stringify(a),
-      a.alertId, a.brand, a.manufacturerSrn, a.manufacturerName, a.manufacturerCountry,
-      a.title, a.description, a.fullContent, a.publishedDate, a.alertType, a.url,
-      JSON.stringify(a.problemCategories || []), !!a.mentionsPatientHarm, !!a.mentionsRecall, !!a.mentionsSoftware,
-      JSON.stringify(a),
-    ],
-  );
+async function insertRefusedApplicationsBatch(apps) {
+  const existing = await loadExistingKeys("REFUSED_APPLICATIONS", "UUID");
+  const rows = (apps || [])
+    .filter(a => a?.uuid && !existing.has(String(a.uuid)))
+    .map(app => {
+      markKeyInserted("REFUSED_APPLICATIONS", "UUID", app.uuid);
+      return {
+        UUID: app.uuid,
+        ACTOR_SRN: app.actorSrn,
+        ACTOR_NAME: app.actorName,
+        NOTIFIED_BODY_SRN: app.notifiedBodySrn,
+        APPLICATION_REFERENCE: app.applicationReferenceNumber,
+        CONFORMITY_PROCEDURE: app.conformityAssessmentProcedure?.code,
+        DECISION: app.decision?.code,
+        DECISION_DATE: app.decisionDate,
+        LAST_UPDATE_DATE: app.lastUpdateDate,
+        RAW_DATA: JSON.stringify(app),
+      };
+    });
+  await bulkMerge({
+    table: "REFUSED_APPLICATIONS",
+    keyCols: ["UUID"],
+    allCols: ["UUID","ACTOR_SRN","ACTOR_NAME","NOTIFIED_BODY_SRN","APPLICATION_REFERENCE","CONFORMITY_PROCEDURE","DECISION","DECISION_DATE","LAST_UPDATE_DATE","RAW_DATA"],
+    updateCols: ["ACTOR_SRN","ACTOR_NAME","NOTIFIED_BODY_SRN","APPLICATION_REFERENCE","CONFORMITY_PROCEDURE","DECISION","DECISION_DATE","LAST_UPDATE_DATE","RAW_DATA"],
+    rows,
+  });
 }
 
-async function insertEUManufacturer(m) {
-  if (!m.srn) return;
-  await executeSQL(
-    `MERGE INTO EU_MANUFACTURERS AS t USING (SELECT ? AS SRN) AS s ON t.SRN = s.SRN
-     WHEN MATCHED THEN UPDATE SET
-       UUID=?, NAME=?, ABBREVIATED_NAME=?, BRAND=?, ACTOR_TYPE=?, STATUS=?,
-       COUNTRY_ISO2=?, COUNTRY_NAME=?, COUNTRY_TYPE=?, GEOGRAPHICAL_ADDRESS=?,
-       CITY_NAME=?, POSTAL_ZONE=?, ELECTRONIC_MAIL=?, TELEPHONE=?,
-       DATE_OF_REGISTRATION=?, VERSION_NUMBER=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (
-       SRN, UUID, NAME, ABBREVIATED_NAME, BRAND, ACTOR_TYPE, STATUS,
-       COUNTRY_ISO2, COUNTRY_NAME, COUNTRY_TYPE, GEOGRAPHICAL_ADDRESS,
-       CITY_NAME, POSTAL_ZONE, ELECTRONIC_MAIL, TELEPHONE,
-       DATE_OF_REGISTRATION, VERSION_NUMBER, RAW_DATA
-     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      m.srn,
-      m.uuid, m.name, m.abbreviatedName, m.brand, m.actorType?.code?.split(".").pop(), m.actorStatus?.code?.split(".").pop(),
-      m.countryIso2Code, m.countryName, m.countryType, m.geographicalAddress,
-      m.cityName, m.postalZone, m.electronicMail, m.telephone,
-      m.dateOfRegistration, m.versionNumber, JSON.stringify(m),
-      m.srn, m.uuid, m.name, m.abbreviatedName, m.brand, m.actorType?.code?.split(".").pop(), m.actorStatus?.code?.split(".").pop(),
-      m.countryIso2Code, m.countryName, m.countryType, m.geographicalAddress,
-      m.cityName, m.postalZone, m.electronicMail, m.telephone,
-      m.dateOfRegistration, m.versionNumber, JSON.stringify(m),
-    ],
-  );
+async function insertSafetyNoticesBatch(source, records) {
+  const existing = await loadExistingKeys("SAFETY_NOTICES", "SOURCE_ID");
+  const rows = [];
+  for (const record of records || []) {
+    const sourceId = `${source}_${(record.deviceName || record.title || "").substring(0, 200)}_${record.updateDate || record.date || ""}`;
+    if (existing.has(sourceId)) continue;
+    markKeyInserted("SAFETY_NOTICES", "SOURCE_ID", sourceId);
+    rows.push({
+      SOURCE: source,
+      SOURCE_ID: sourceId,
+      TITLE: record.title || record.deviceName,
+      DEVICE_NAME: record.deviceName,
+      DEVICE_TYPE: record.deviceType,
+      STATUS: record.status,
+      NOTICE_DATE: record.updateDate || record.date,
+      RETURN_DATE: record.returnDate,
+      TOPIC: record.topic,
+      URL: record.url,
+      RAW_DATA: JSON.stringify(record),
+    });
+  }
+  await bulkMerge({
+    table: "SAFETY_NOTICES",
+    keyCols: ["SOURCE_ID"],
+    allCols: ["SOURCE","SOURCE_ID","TITLE","DEVICE_NAME","DEVICE_TYPE","STATUS","NOTICE_DATE","RETURN_DATE","TOPIC","URL","RAW_DATA"],
+    updateCols: ["SOURCE","TITLE","DEVICE_NAME","DEVICE_TYPE","STATUS","NOTICE_DATE","RETURN_DATE","TOPIC","URL","RAW_DATA"],
+    rows,
+  });
 }
 
-async function insertClinicalTrial(r) {
-  const p = r.protocolSection || r;
-  const nctId = p.identificationModule?.nctId || r.nct_id;
-  if (!nctId) return;
-  const title = p.identificationModule?.briefTitle || null;
-  const officialTitle = p.identificationModule?.officialTitle || null;
-  const briefSummary = p.descriptionModule?.briefSummary || null;
-  const condition = (p.conditionsModule?.conditions || []).join("; ") || null;
-  const interventions = p.armsInterventionsModule?.interventions || [];
-  const interventionType = interventions.map(i => i.type).filter(Boolean).join(", ") || null;
-  const interventionName = interventions.map(i => i.name).filter(Boolean).join("; ") || null;
-  const sponsor = p.sponsorCollaboratorsModule?.leadSponsor?.name || null;
-  const phase = (p.designModule?.phases || []).join(", ") || null;
-  const status = p.statusModule?.overallStatus || null;
-  const studyType = p.designModule?.studyType || null;
-  const primaryOutcome = (p.outcomesModule?.primaryOutcomes || []).map(o => o.measure).filter(Boolean).join("; ") || null;
-  const enrollment = p.designModule?.enrollmentInfo?.count || null;
-  const startDate = p.statusModule?.startDateStruct?.date || null;
-  const completionDate = p.statusModule?.completionDateStruct?.date || null;
-  const countries = [...new Set((p.contactsLocationsModule?.locations || []).map(l => l.country))].filter(Boolean).join(", ") || null;
-  await executeSQL(
-    `MERGE INTO CLINICAL_TRIALS AS t USING (SELECT ? AS NCT_ID) AS s ON t.NCT_ID = s.NCT_ID
-     WHEN MATCHED THEN UPDATE SET TITLE=?, OFFICIAL_TITLE=?, BRIEF_SUMMARY=?, CONDITION=?, INTERVENTION_TYPE=?, INTERVENTION_NAME=?, SPONSOR=?, PHASE=?, STATUS=?, STUDY_TYPE=?, PRIMARY_OUTCOME=?, ENROLLMENT=?, START_DATE=?, COMPLETION_DATE=?, COUNTRY=?, URL=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (NCT_ID, TITLE, OFFICIAL_TITLE, BRIEF_SUMMARY, CONDITION, INTERVENTION_TYPE, INTERVENTION_NAME, SPONSOR, PHASE, STATUS, STUDY_TYPE, PRIMARY_OUTCOME, ENROLLMENT, START_DATE, COMPLETION_DATE, COUNTRY, URL, RAW_DATA)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      nctId,
-      title, officialTitle, briefSummary, condition, interventionType, interventionName, sponsor, phase, status, studyType, primaryOutcome, enrollment, startDate, completionDate, countries, `https://clinicaltrials.gov/study/${nctId}`, JSON.stringify(r),
-      nctId, title, officialTitle, briefSummary, condition, interventionType, interventionName, sponsor, phase, status, studyType, primaryOutcome, enrollment, startDate, completionDate, countries, `https://clinicaltrials.gov/study/${nctId}`, JSON.stringify(r),
-    ],
-  );
+async function insertMHRAAlertsBatch(alerts) {
+  const existing = await loadExistingKeys("MHRA_ALERTS", "ALERT_ID");
+  const rows = (alerts || [])
+    .filter(a => a?.alertId && !existing.has(String(a.alertId)))
+    .map(a => {
+      markKeyInserted("MHRA_ALERTS", "ALERT_ID", a.alertId);
+      return {
+        ALERT_ID: a.alertId,
+        BRAND: a.brand,
+        MANUFACTURER_SRN: a.manufacturerSrn,
+        MANUFACTURER_NAME: a.manufacturerName,
+        MANUFACTURER_COUNTRY: a.manufacturerCountry,
+        TITLE: a.title,
+        DESCRIPTION: a.description,
+        FULL_CONTENT: a.fullContent,
+        PUBLISHED_DATE: a.publishedDate,
+        ALERT_TYPE: a.alertType,
+        URL: a.url,
+        PROBLEM_CATEGORIES: JSON.stringify(a.problemCategories || []),
+        MENTIONS_PATIENT_HARM: !!a.mentionsPatientHarm,
+        MENTIONS_RECALL: !!a.mentionsRecall,
+        MENTIONS_SOFTWARE: !!a.mentionsSoftware,
+        RAW_DATA: JSON.stringify(a),
+      };
+    });
+  await bulkMerge({
+    table: "MHRA_ALERTS",
+    keyCols: ["ALERT_ID"],
+    allCols: ["ALERT_ID","BRAND","MANUFACTURER_SRN","MANUFACTURER_NAME","MANUFACTURER_COUNTRY","TITLE","DESCRIPTION","FULL_CONTENT","PUBLISHED_DATE","ALERT_TYPE","URL","PROBLEM_CATEGORIES","MENTIONS_PATIENT_HARM","MENTIONS_RECALL","MENTIONS_SOFTWARE","RAW_DATA"],
+    updateCols: ["BRAND","MANUFACTURER_SRN","MANUFACTURER_NAME","MANUFACTURER_COUNTRY","TITLE","DESCRIPTION","FULL_CONTENT","PUBLISHED_DATE","ALERT_TYPE","URL","PROBLEM_CATEGORIES","MENTIONS_PATIENT_HARM","MENTIONS_RECALL","MENTIONS_SOFTWARE","RAW_DATA"],
+    rows,
+  });
 }
 
-async function insertEuropePmc(r) {
-  const pmid = r.pmid || null;
-  const pmcid = r.pmcid || null;
-  const key = pmid || pmcid || r.id;
-  if (!key) return;
-  await executeSQL(
-    `MERGE INTO EUROPE_PMC_ARTICLES AS t USING (SELECT ? AS PMID, ? AS PMCID) AS s ON (t.PMID = s.PMID AND s.PMID IS NOT NULL) OR (t.PMCID = s.PMCID AND s.PMCID IS NOT NULL)
-     WHEN MATCHED THEN UPDATE SET DOI=?, TITLE=?, ABSTRACT=?, AUTHORS=?, JOURNAL=?, PUBLICATION_DATE=?, SEARCH_TERM=?, HAS_FULLTEXT=?, URL=?, RAW_DATA=?
-     WHEN NOT MATCHED THEN INSERT (PMID, PMCID, DOI, TITLE, ABSTRACT, AUTHORS, JOURNAL, PUBLICATION_DATE, SEARCH_TERM, HAS_FULLTEXT, URL, RAW_DATA)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [
-      pmid, pmcid,
-      r.doi, r.title, r.abstractText, r.authorString, r.journalTitle, r.firstPublicationDate, r.searchTerm, r.hasFullText === "Y", pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : (pmcid ? `https://europepmc.org/article/PMC/${pmcid}` : null), JSON.stringify(r),
-      pmid, pmcid, r.doi, r.title, r.abstractText, r.authorString, r.journalTitle, r.firstPublicationDate, r.searchTerm, r.hasFullText === "Y", pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : (pmcid ? `https://europepmc.org/article/PMC/${pmcid}` : null), JSON.stringify(r),
-    ],
-  );
+async function insertEUManufacturersBatch(mfrs) {
+  const rows = (mfrs || []).filter(m => m?.srn).map(m => ({
+    SRN: m.srn,
+    UUID: m.uuid,
+    NAME: m.name,
+    ABBREVIATED_NAME: m.abbreviatedName,
+    BRAND: m.brand,
+    ACTOR_TYPE: m.actorType?.code?.split(".").pop(),
+    STATUS: m.actorStatus?.code?.split(".").pop(),
+    COUNTRY_ISO2: m.countryIso2Code,
+    COUNTRY_NAME: m.countryName,
+    COUNTRY_TYPE: m.countryType,
+    GEOGRAPHICAL_ADDRESS: m.geographicalAddress,
+    CITY_NAME: m.cityName,
+    POSTAL_ZONE: m.postalZone,
+    ELECTRONIC_MAIL: m.electronicMail,
+    TELEPHONE: m.telephone,
+    DATE_OF_REGISTRATION: m.dateOfRegistration,
+    VERSION_NUMBER: m.versionNumber,
+    RAW_DATA: JSON.stringify(m),
+  }));
+  await bulkMerge({
+    table: "EU_MANUFACTURERS",
+    keyCols: ["SRN"],
+    allCols: ["SRN","UUID","NAME","ABBREVIATED_NAME","BRAND","ACTOR_TYPE","STATUS","COUNTRY_ISO2","COUNTRY_NAME","COUNTRY_TYPE","GEOGRAPHICAL_ADDRESS","CITY_NAME","POSTAL_ZONE","ELECTRONIC_MAIL","TELEPHONE","DATE_OF_REGISTRATION","VERSION_NUMBER","RAW_DATA"],
+    updateCols: ["UUID","NAME","ABBREVIATED_NAME","BRAND","ACTOR_TYPE","STATUS","COUNTRY_ISO2","COUNTRY_NAME","COUNTRY_TYPE","GEOGRAPHICAL_ADDRESS","CITY_NAME","POSTAL_ZONE","ELECTRONIC_MAIL","TELEPHONE","DATE_OF_REGISTRATION","VERSION_NUMBER","RAW_DATA"],
+    rows,
+  });
 }
+
+async function insertClinicalTrialsBatch(trials) {
+  const rows = [];
+  for (const r of trials || []) {
+    const p = r.protocolSection || r;
+    const nctId = p.identificationModule?.nctId || r.nct_id;
+    if (!nctId) continue;
+    const interventions = p.armsInterventionsModule?.interventions || [];
+    rows.push({
+      NCT_ID: nctId,
+      TITLE: p.identificationModule?.briefTitle || null,
+      OFFICIAL_TITLE: p.identificationModule?.officialTitle || null,
+      BRIEF_SUMMARY: p.descriptionModule?.briefSummary || null,
+      CONDITION: (p.conditionsModule?.conditions || []).join("; ") || null,
+      INTERVENTION_TYPE: interventions.map(i => i.type).filter(Boolean).join(", ") || null,
+      INTERVENTION_NAME: interventions.map(i => i.name).filter(Boolean).join("; ") || null,
+      SPONSOR: p.sponsorCollaboratorsModule?.leadSponsor?.name || null,
+      PHASE: (p.designModule?.phases || []).join(", ") || null,
+      STATUS: p.statusModule?.overallStatus || null,
+      STUDY_TYPE: p.designModule?.studyType || null,
+      PRIMARY_OUTCOME: (p.outcomesModule?.primaryOutcomes || []).map(o => o.measure).filter(Boolean).join("; ") || null,
+      ENROLLMENT: p.designModule?.enrollmentInfo?.count || null,
+      START_DATE: p.statusModule?.startDateStruct?.date || null,
+      COMPLETION_DATE: p.statusModule?.completionDateStruct?.date || null,
+      COUNTRY: [...new Set((p.contactsLocationsModule?.locations || []).map(l => l.country))].filter(Boolean).join(", ") || null,
+      URL: `https://clinicaltrials.gov/study/${nctId}`,
+      RAW_DATA: JSON.stringify(r),
+    });
+  }
+  await bulkMerge({
+    table: "CLINICAL_TRIALS",
+    keyCols: ["NCT_ID"],
+    allCols: ["NCT_ID","TITLE","OFFICIAL_TITLE","BRIEF_SUMMARY","CONDITION","INTERVENTION_TYPE","INTERVENTION_NAME","SPONSOR","PHASE","STATUS","STUDY_TYPE","PRIMARY_OUTCOME","ENROLLMENT","START_DATE","COMPLETION_DATE","COUNTRY","URL","RAW_DATA"],
+    updateCols: ["TITLE","OFFICIAL_TITLE","BRIEF_SUMMARY","CONDITION","INTERVENTION_TYPE","INTERVENTION_NAME","SPONSOR","PHASE","STATUS","STUDY_TYPE","PRIMARY_OUTCOME","ENROLLMENT","START_DATE","COMPLETION_DATE","COUNTRY","URL","RAW_DATA"],
+    rows,
+  });
+}
+
+async function insertEuropePmcBatch(articles) {
+  const rows = [];
+  for (const r of articles || []) {
+    const pmid = r.pmid || null;
+    const pmcid = r.pmcid || null;
+    if (!pmid && !pmcid && !r.id) continue;
+    rows.push({
+      // Synthesize a single dedupe key so JS-side dedupe works reliably
+      _DEDUPE_KEY: pmid || pmcid || r.id,
+      PMID: pmid,
+      PMCID: pmcid,
+      DOI: r.doi,
+      TITLE: r.title,
+      ABSTRACT: r.abstractText,
+      AUTHORS: r.authorString,
+      JOURNAL: r.journalTitle,
+      PUBLICATION_DATE: r.firstPublicationDate,
+      SEARCH_TERM: r.searchTerm,
+      HAS_FULLTEXT: r.hasFullText === "Y",
+      URL: pmid ? `https://pubmed.ncbi.nlm.nih.gov/${pmid}/` : (pmcid ? `https://europepmc.org/article/PMC/${pmcid}` : null),
+      RAW_DATA: JSON.stringify(r),
+    });
+  }
+  // Dedupe by synthesized key
+  const seen = new Map();
+  for (const row of rows) seen.set(row._DEDUPE_KEY, row);
+  const deduped = [...seen.values()].map(({ _DEDUPE_KEY, ...rest }) => rest);
+  // Partition by which key is populated: PMID present vs PMCID-only. Two merges avoid the ambiguous OR join.
+  const pmidRows = deduped.filter(r => r.PMID);
+  const pmcidOnly = deduped.filter(r => !r.PMID && r.PMCID);
+  const allCols = ["PMID","PMCID","DOI","TITLE","ABSTRACT","AUTHORS","JOURNAL","PUBLICATION_DATE","SEARCH_TERM","HAS_FULLTEXT","URL","RAW_DATA"];
+  const updateCols = ["DOI","TITLE","ABSTRACT","AUTHORS","JOURNAL","PUBLICATION_DATE","SEARCH_TERM","HAS_FULLTEXT","URL","RAW_DATA"];
+  if (pmidRows.length) {
+    await bulkMerge({ table: "EUROPE_PMC_ARTICLES", keyCols: ["PMID"], allCols, updateCols: ["PMCID", ...updateCols], rows: pmidRows });
+  }
+  if (pmcidOnly.length) {
+    await bulkMerge({ table: "EUROPE_PMC_ARTICLES", keyCols: ["PMCID"], allCols, updateCols, rows: pmcidOnly });
+  }
+}
+
+// === SINGLE-ROW WRAPPERS (backward compat — prefer *Batch variants) ===
+async function insertNotifiedBody(nb) { await insertNotifiedBodiesBatch([nb]); }
+async function insertRefusedApplication(app) { await insertRefusedApplicationsBatch([app]); }
+async function insertSafetyNotice(source, record) { await insertSafetyNoticesBatch(source, [record]); }
+async function insertMHRAAlert(a) { await insertMHRAAlertsBatch([a]); }
+async function insertEUManufacturer(m) { await insertEUManufacturersBatch([m]); }
+async function insertClinicalTrial(r) { await insertClinicalTrialsBatch([r]); }
+async function insertEuropePmc(r) { await insertEuropePmcBatch([r]); }
 
 async function getTableCount(tableName) {
   try {
@@ -827,6 +1018,16 @@ module.exports = {
   executeSQL,
   useDB,
   setupDatabase,
+  // Batch (preferred)
+  insertDevicesBatch,
+  insertNotifiedBodiesBatch,
+  insertRefusedApplicationsBatch,
+  insertSafetyNoticesBatch,
+  insertMHRAAlertsBatch,
+  insertEUManufacturersBatch,
+  insertClinicalTrialsBatch,
+  insertEuropePmcBatch,
+  // Single-row (legacy wrappers)
   insertDeviceComplete,
   insertNotifiedBody,
   insertRefusedApplication,

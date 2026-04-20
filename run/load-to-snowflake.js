@@ -3,12 +3,10 @@ const fs = require("fs");
 const path = require("path");
 const {
   setupDatabase,
-  insertDeviceComplete,
-  insertNotifiedBody,
-  insertRefusedApplication,
-  insertEMAMedicine,
-  insertCochraneReview,
-  insertSafetyNotice,
+  insertDevicesBatch,
+  insertNotifiedBodiesBatch,
+  insertRefusedApplicationsBatch,
+  insertSafetyNoticesBatch,
   getTableCount,
   closeConnection,
 } = require("../data/snowflake");
@@ -31,53 +29,25 @@ async function loadBulkData() {
   // 1. Notified Bodies
   log("SNOWFLAKE", "Loading notified bodies...");
   const nbData = loadJSON(path.join(BULK_DIR, "eudamed_notified_bodies.json"));
-  for (const nb of nbData) {
-    await insertNotifiedBody(nb);
-  }
+  await insertNotifiedBodiesBatch(nbData);
   log("SNOWFLAKE", `Notified bodies: ${nbData.length} loaded`);
 
   // 2. Refused Applications
   log("SNOWFLAKE", "Loading refused applications...");
   const apps = loadJSON(path.join(BULK_DIR, "eudamed_refused_applications.json"));
-  for (const app of apps) {
-    await insertRefusedApplication(app);
-  }
+  await insertRefusedApplicationsBatch(apps);
   log("SNOWFLAKE", `Refused applications: ${apps.length} loaded`);
 
-  // 3. EMA Medicines
-  log("SNOWFLAKE", "Loading EMA medicines...");
-  const ema = loadJSON(path.join(BULK_DIR, "ema_medicines.json"));
-  let emaCount = 0;
-  for (const med of ema) {
-    if (med.category === "Human") {
-      await insertEMAMedicine(med);
-      emaCount++;
-    }
-  }
-  log("SNOWFLAKE", `EMA medicines: ${emaCount} loaded`);
-
-  // 4. Cochrane/PubMed Reviews
-  log("SNOWFLAKE", "Loading Cochrane/PubMed reviews...");
-  const reviews = loadJSON(path.join(BULK_DIR, "cochrane_pubmed_reviews.json"));
-  for (const review of reviews) {
-    await insertCochraneReview(review);
-  }
-  log("SNOWFLAKE", `Cochrane reviews: ${reviews.length} loaded`);
-
-  // 5. ANSM Safety
+  // 3. ANSM Safety
   log("SNOWFLAKE", "Loading ANSM safety data...");
   const ansm = loadJSON(path.join(BULK_DIR, "ansm_safety.json"));
-  for (const record of ansm) {
-    await insertSafetyNotice("ANSM", record);
-  }
+  await insertSafetyNoticesBatch("ANSM", ansm);
   log("SNOWFLAKE", `ANSM records: ${ansm.length} loaded`);
 
-  // 6. SCHEER Opinions
+  // 4. SCHEER Opinions
   log("SNOWFLAKE", "Loading SCHEER opinions...");
   const scheer = loadJSON(path.join(BULK_DIR, "scheer_opinions.json"));
-  for (const record of scheer) {
-    await insertSafetyNotice("SCHEER", { ...record, deviceName: record.title });
-  }
+  await insertSafetyNoticesBatch("SCHEER", scheer.map(r => ({ ...r, deviceName: r.title })));
   log("SNOWFLAKE", `SCHEER opinions: ${scheer.length} loaded`);
 }
 
@@ -90,22 +60,35 @@ async function loadDevices() {
   const files = fs.readdirSync(DEVICES_DIR).filter((f) => f.endsWith(".json"));
   log("SNOWFLAKE", `Loading ${files.length} devices...`);
 
+  const BATCH_SIZE = 100;
   let loaded = 0;
   let errors = 0;
+  let buffer = [];
+
+  const flush = async () => {
+    if (buffer.length === 0) return;
+    try {
+      await insertDevicesBatch(buffer);
+      loaded += buffer.length;
+      log("SNOWFLAKE", `Devices progress: ${loaded}/${files.length} (${((loaded / files.length) * 100).toFixed(1)}%)`);
+    } catch (error) {
+      errors += buffer.length;
+      if (errors <= 5) log("SNOWFLAKE", `Batch error: ${error.message}`);
+    }
+    buffer = [];
+  };
 
   for (const file of files) {
     try {
       const deviceJSON = JSON.parse(fs.readFileSync(path.join(DEVICES_DIR, file), "utf-8"));
-      await insertDeviceComplete(deviceJSON);
-      loaded++;
-      if (loaded % 50 === 0) {
-        log("SNOWFLAKE", `Devices progress: ${loaded}/${files.length} (${((loaded / files.length) * 100).toFixed(1)}%)`);
-      }
+      buffer.push(deviceJSON);
+      if (buffer.length >= BATCH_SIZE) await flush();
     } catch (error) {
       errors++;
       if (errors <= 5) log("SNOWFLAKE", `Error loading ${file}: ${error.message}`);
     }
   }
+  await flush();
 
   log("SNOWFLAKE", `Devices loaded: ${loaded} | Errors: ${errors}`);
 }
@@ -134,7 +117,7 @@ async function main() {
 
   // Stats
   log("MAIN", "====== Final Stats ======");
-  const tables = ["DEVICE_COMPLETE", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "EMA_MEDICINES", "COCHRANE_REVIEWS", "SAFETY_NOTICES"];
+  const tables = ["DEVICES", "NOTIFIED_BODIES", "REFUSED_APPLICATIONS", "SAFETY_NOTICES"];
   for (const table of tables) {
     const count = await getTableCount(table);
     log("MAIN", `  ${table}: ${count} rows`);

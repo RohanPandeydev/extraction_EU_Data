@@ -12,17 +12,9 @@ name: Medical Device Data Extraction -> Snowflake
 # ==========================
 
 on:
-  push:
-    branches: [master, main]
-    paths:
-      - 'script.js'
-      - 'data/**'
-      - 'scrapers/**'
-      - 'utils/**'
-      - 'headers.js'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/data-extraction.yml'
+  # NOTE: 'push' trigger was removed — it re-ran the full extraction on every code change
+  # (~32k MERGEs in a single day on Apr 17), costing hundreds of Snowflake credits per week.
+  # Use workflow_dispatch for manual runs, or let the cron handle daily/weekly.
   schedule:
     # Daily device extraction — rotating 16-day coverage cycle
     - cron: '0 2 * * *'
@@ -94,11 +86,6 @@ jobs:
               DAY_OF_YEAR=$(date -u +%j | sed 's/^0*//')
               OFFSET=$((DAY_OF_YEAR % 16))
             fi
-          elif [ "$EVENT" = "push" ]; then
-            # Auto-run on push — same rotation as daily cron
-            MODE='parallel-full'
-            DAY_OF_YEAR=$(date -u +%j | sed 's/^0*//')
-            OFFSET=$((DAY_OF_YEAR % 16))
           else
             MODE="${INPUT_MODE:-parallel-full}"
             OFFSET="${INPUT_OFFSET:-0}"
